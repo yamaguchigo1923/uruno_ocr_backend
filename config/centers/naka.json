@@ -4,7 +4,7 @@
   "templateSpreadsheetId": "1tIO4OvE5SC0NN1tDEIAbZV6xQ_4QiA3Jd7Pi2gLfN1o",
   "templateSheetId": 1557733602,
   "exportStartRow": 32,
-  "coverPages": 1,
+  "coverPages": 0,
   "crop": {
     "top_pct": 0.0,
     "bottom_pct": 0.0,
@@ -27,36 +27,14 @@
     }
   },
   "nutrition": {
-    "module": [
-      1
-    ],
-    "col": [
-      "規 格",
-      "規格",
-      "銘柄·条件",
-      "銘柄・条件",
-      "銘柄条件"
-    ],
-    "matching": [
-      "内容表提出",
-      "成分表提出"
-    ]
+    "module": [1],
+    "col": ["銘柄·条件", "銘柄・条件", "銘柄条件"],
+    "matching": ["配合表", "合表"]
   },
   "sample": {
-    "module": [
-      1
-    ],
-    "col": [
-      "規 格",
-      "規格",
-      "備考"
-    ],
-    "matching": [
-      "見本提出",
-      "見本 提出",
-      "◯",
-      "○",
-      "O"
-    ]
+    "module": [1],
+    "col": ["銘柄·条件", "銘柄・条件", "銘柄条件"],
+    "matching_all": ["サンプル", "サンプ", "ンプル"],
+    "matching_part": []
   }
 }

@@ -193,9 +193,14 @@ def build_matching_table(
     mihon_idx = header.index("見本")
 
     data_rows: List[List[str]] = []
+    # IMPORTANT: Keep row alignment consistent with module_1 by using a dynamic
+    # current_header_row for repeated-header detection (re-pick), not the fixed base_header.
+    current_header_row = base_header
     for row in normalized_rows[header_index + 1 :]:
-        # Only skip rows that look like repeated header rows (strict equality on >=2 cells)
-        if header_candidates and _is_repeated_header_row(row, base_header, header_candidates):
+        # Skip rows that look like repeated header rows (strict equality on >=2 cells)
+        # and update the current_header_row baseline just like module_1 does.
+        if header_candidates and _is_repeated_header_row(row, current_header_row, header_candidates):
+            current_header_row = row
             continue
         normalized = list(row)
         if len(normalized) > len(header):
@@ -238,6 +243,20 @@ def build_matching_table(
             c_hdr = meta.get("col_header", "")
             log_fn(f"[MATCH][{target}] candidates={cand} match_terms={terms} mode={mode}")
             log_fn(f"[MATCH][{target}] picked header_index={h_idx} col_index={c_idx} col_header='{c_hdr}'")
+            # If module reported re-picks (mid-table header/column changes), log them for traceability
+            repicks = meta.get("repicks") or []
+            try:
+                if isinstance(repicks, list) and repicks:
+                    for r in repicks[:5]:  # limit to 5 entries to avoid log spam
+                        try:
+                            r_idx = r.get("src_row_index")
+                            rc = r.get("col_index")
+                            rh = r.get("col_header", "")
+                            log_fn(f"[MATCH][{target}][reheader] at src_row_index={r_idx} col_index={rc} col_header='{rh}'")
+                        except Exception:
+                            continue
+            except Exception:
+                pass
         if not result:
             target_hits[target] = 0
             target_maps[target] = {}
@@ -265,11 +284,111 @@ def build_matching_table(
                 hits += 1
         if log_fn:
             matched_rows = [i for i, v in mapping.items() if bool(v.get("matched"))]
-            log_fn(f"[MATCH][{target}] hits={hits} matched_rows={matched_rows}")
+            # Include up to 5 examples with matched terms for easier debugging
+            examples = []
+            cell_examples = []
+            for i in matched_rows[:5]:
+                entry = mapping.get(i, {})
+                term = entry.get("matched_term")
+                mode = entry.get("matched_mode")
+                cell = entry.get("cell") or ""
+                cell_prev = (cell[:40] + ("…" if len(cell) > 40 else "")) if isinstance(cell, str) else ""
+                used_hdr = entry.get("col_header_used") or ""
+                if term:
+                    if mode:
+                        examples.append(f"{i}:{term}({mode})")
+                    else:
+                        examples.append(f"{i}:{term}")
+                else:
+                    examples.append(str(i))
+                if used_hdr:
+                    cell_examples.append(f"{i}:{used_hdr}:{cell_prev}")
+                else:
+                    cell_examples.append(f"{i}:{cell_prev}")
+            ex_str = (" examples=" + ",".join(examples)) if examples else ""
+            log_fn(f"[MATCH][{target}] hits={hits} matched_rows={matched_rows}{ex_str}")
+            if cell_examples:
+                log_fn(f"[MATCH][{target}] cells={cell_examples}")
+
+            # Per-hit detailed debug: one line per matched row with full cell and highlighted hit term
+            try:
+                def _highlight_once(text: str, term: str) -> str:
+                    try:
+                        idx = text.find(term)
+                        if idx == -1:
+                            return text
+                        return text[:idx] + "«" + term + "»" + text[idx+len(term):]
+                    except Exception:
+                        return text
+
+                for i in matched_rows:
+                    entry = mapping.get(i, {})
+                    cell_full = entry.get("cell") or ""
+                    term = entry.get("matched_term") or ""
+                    mode = entry.get("matched_mode") or ""
+                    used_hdr = entry.get("col_header_used") or ""
+                    if isinstance(cell_full, str) and isinstance(term, str) and term:
+                        highlighted = _highlight_once(cell_full, term)
+                    else:
+                        highlighted = cell_full if isinstance(cell_full, str) else str(cell_full)
+                    # One-line debug per hit row
+                    if mode:
+                        log_fn(f"[MATCH][{target}][row={i}] term='{term}' mode={mode} col='{used_hdr}' cell='{highlighted}'")
+                    else:
+                        log_fn(f"[MATCH][{target}][row={i}] term='{term}' col='{used_hdr}' cell='{highlighted}'")
+            except Exception:
+                pass
         target_hits[target] = hits
         target_maps[target] = mapping
 
+    # Reflect the actual cell used for matching into the preview table's display column (規格など).
+    # We choose the first header column that matches any of the header candidates; if not found,
+    # we fallback to the first column that contains "規格".
+    display_spec_idx: Optional[int] = None
+    if header:
+        # 1) try header candidates
+        cand_set = []
+        try:
+            cand_set = [str(c) for c in header_candidates]
+        except Exception:
+            cand_set = []
+        found = False
+        if cand_set:
+            for i, h in enumerate(header):
+                hs = str(h) if h is not None else ""
+                for c in cand_set:
+                    if c and c in hs:
+                        display_spec_idx = i
+                        found = True
+                        break
+                if found:
+                    break
+        # 2) fallback to '規格' literal
+        if display_spec_idx is None:
+            for i, h in enumerate(header):
+                hs = str(h) if h is not None else ""
+                if ("規格" in hs) or ("規 格" in hs):
+                    display_spec_idx = i
+                    break
+
+    # Build a per-row view of the cell actually used by modules (prefer nutrition over sample when both available)
+    used_cell_by_row: Dict[int, str] = {}
+    if display_spec_idx is not None:
+        for i in range(1, len(data_rows) + 1):
+            n_entry = target_maps.get("nutrition", {}).get(i)
+            s_entry = target_maps.get("sample", {}).get(i)
+            val = None
+            if isinstance(n_entry, dict):
+                val = n_entry.get("cell")
+            if (val is None or val == "") and isinstance(s_entry, dict):
+                val = s_entry.get("cell")
+            if isinstance(val, str) and val != "":
+                used_cell_by_row[i] = val
+
+    # Apply used cell preview (if available) and then flags
     for idx, row in enumerate(data_rows, start=1):
+        if display_spec_idx is not None and idx in used_cell_by_row and display_spec_idx < len(row):
+            row[display_spec_idx] = used_cell_by_row[idx]
         nutrition = target_maps.get("nutrition", {}).get(idx)
         sample = target_maps.get("sample", {}).get(idx)
         nutrition_flag = False

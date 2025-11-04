@@ -341,6 +341,79 @@ def process_order(
         filtered_orig_indices = []
     # --- ここまで ---
 
+    # Emit a compact debug summary from the pipeline side as well so that
+    # apps always see match hints even if engine-level logs are filtered.
+    # Do this AFTER row filtering/renumbering so 行番号と一致する。
+    try:
+        if processed_rows:
+            header = processed_rows[0]
+            data = processed_rows[1:]
+            # locate columns
+            spec_idx = None
+            for i, h in enumerate(header):
+                hs = str(h) if h is not None else ""
+                if "規格" in hs or "規 格" in hs or ("規" in hs and "格" in hs):
+                    spec_idx = i
+                    break
+            try:
+                seibun_idx = header.index("成分表")
+            except ValueError:
+                seibun_idx = -1
+            try:
+                mihon_idx = header.index("見本")
+            except ValueError:
+                mihon_idx = -1
+
+            # collect configured terms for quick hinting (order-preserving de-dup)
+            def _terms(block: str) -> list[str]:
+                b = center_conf.get(block) if isinstance(center_conf.get(block), dict) else {}
+                all_terms: list[str] = []
+                for k in ("matching_all", "matching_part", "matching"):
+                    v = b.get(k)
+                    if isinstance(v, str):
+                        all_terms.append(v)
+                    elif isinstance(v, list):
+                        all_terms.extend([str(x) for x in v if isinstance(x, str)])
+                seen: set[str] = set()
+                out: list[str] = []
+                for t in all_terms:
+                    if t not in seen:
+                        seen.add(t)
+                        out.append(t)
+                return out
+
+            nut_terms = _terms("nutrition")
+            sam_terms = _terms("sample")
+
+            # gather up to 10 examples (sorted by 行番号の昇順にそのまま走査)
+            examples_n: list[str] = []
+            examples_s: list[str] = []
+            for row in data:
+                if spec_idx is None or spec_idx >= len(row):
+                    continue
+                try:
+                    row_no = str(row[0])  # 行番号列
+                except Exception:
+                    row_no = "?"
+                cell = str(row[spec_idx]) if row[spec_idx] is not None else ""
+                # nutrition examples
+                if seibun_idx >= 0 and seibun_idx < len(row) and row[seibun_idx] == "○" and len(examples_n) < 10:
+                    term = next((t for t in nut_terms if t and t in cell), "")
+                    preview = (cell[:40] + ("…" if len(cell) > 40 else "")) if cell else ""
+                    examples_n.append(f"{row_no}:{term or '-'}:{preview}")
+                # sample examples
+                if mihon_idx >= 0 and mihon_idx < len(row) and row[mihon_idx] in {"3", "○"} and len(examples_s) < 10:
+                    term = next((t for t in sam_terms if t and t in cell), "")
+                    preview = (cell[:40] + ("…" if len(cell) > 40 else "")) if cell else ""
+                    examples_s.append(f"{row_no}:{term or '-'}:{preview}")
+            if examples_n:
+                _log(f"[MATCH][SUMMARY][nutrition] examples={examples_n}")
+            if examples_s:
+                _log(f"[MATCH][SUMMARY][sample] examples={examples_s}")
+    except Exception:
+        # Do not let debug hinting break the pipeline
+        logger.exception("failed to emit match summary (post-renumber)")
+
     ocr_snapshot_url = ""
     if processed_rows and sheet_name:
         ocr_snapshot_url = sheet_generator.write_ocr_snapshot(sheet_name, processed_rows)

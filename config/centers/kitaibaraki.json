@@ -35,7 +35,7 @@
   "sample": {
     "module": [1],
     "col": ["規格", "規 格"],
-    "matching_all": ["見本"],
+    "matching_all": ["見本提出", "本提出", "見本"],
     "matching_part": []
   }
 }
