@@ -1,0 +1,2 @@
+timestamp,input_path,page,output_image_path,orig_width,orig_height,new_width,new_height,top_pct,bottom_pct,left_pct,right_pct,recognized_tables
+2025-10-31T04:53:33.603202Z,C:\Users\user\project\uruno_ocr_demo\backend\test\image_preprocessing\data\鉾田学校給食センター（10月分）.pdf,1,C:\Users\user\project\uruno_ocr_demo\backend\test\image_preprocessing\output\run_20251031_135333\鉾田学校給食センター（10月分）_page1_cropped.png,596,843,596,759,0.1,0.0,0.0,0.0,[]

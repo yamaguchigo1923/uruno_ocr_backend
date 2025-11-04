@@ -1,0 +1,62 @@
+{
+  "id": "johoku",
+  "displayName": "常北学校給食センター",
+  "templateSpreadsheetId": "1tIO4OvE5SC0NN1tDEIAbZV6xQ_4QiA3Jd7Pi2gLfN1o",
+  "templateSheetId": 1557733602,
+  "exportStartRow": 33,
+  "coverPages": 1,
+  "crop": {
+    "top_pct": 0.0,
+    "bottom_pct": 0.0,
+    "left_pct": 0.0,
+    "right_pct": 0.0
+  },
+  "poll": {
+    "startCol": "B",
+    "endCol": "K",
+    "readyColRelativeIndex": 0,
+    "minReadyRatio": 0.95,
+    "maxWaitSec": 600
+  },
+  "ranges": {
+    "catalog": "'商品'!A10:H30000",
+    "export": {
+      "makerHeader": "B4:E4",
+      "centerName": "B27:E27",
+      "month": "F27"
+    }
+  },
+  "nutrition": {
+    "module": [
+      1
+    ],
+    "col": [
+      "規 格",
+      "規格",
+      "銘柄·条件",
+      "銘柄・条件",
+      "銘柄条件"
+    ],
+    "matching": [
+      "内容表提出",
+      "成分表提出"
+    ]
+  },
+  "sample": {
+    "module": [
+      1
+    ],
+    "col": [
+      "規 格",
+      "規格",
+      "備考"
+    ],
+    "matching": [
+      "見本提出",
+      "見本 提出",
+      "◯",
+      "○",
+      "O"
+    ]
+  }
+}
