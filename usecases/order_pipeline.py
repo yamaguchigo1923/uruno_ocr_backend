@@ -57,8 +57,15 @@ def _collect_ocr_rows(
     cover_pages: int,
     log: Callable[[str], None],
     center_conf: dict | None = None,
-) -> List[List[str]]:
+) -> Tuple[List[List[str]], List[List[List[str]]]]:
+    """Collect OCR rows and also keep per-page tables for page-scoped matching.
+
+    Returns a tuple: (merged_rows, page_tables)
+      - merged_rows: single header then all body rows across pages (legacy behavior)
+      - page_tables: list of tables per page/table, each including its own header as rows[0]
+    """
     merged_rows: List[List[str]] = []
+    page_tables: List[List[List[str]]] = []
     cover_pages_remaining = max(0, cover_pages)
     header_written = False
     skipped_any = False
@@ -115,6 +122,9 @@ def _collect_ocr_rows(
                         f"[OCR][TABLE] file_idx={file_idx} page={page_display} table_idx={table_idx} "
                         f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
                     )
+                    # keep per-page table with its own header
+                    if table.rows:
+                        page_tables.append([list(r) for r in table.rows])
             continue
 
         # If PDF but cannot split (e.g., PyPDF2 not installed), render all pages and crop/analyze per page
@@ -157,6 +167,8 @@ def _collect_ocr_rows(
                             f"[OCR][TABLE] file_idx={file_idx} page={page_display} table_idx={table_idx} "
                             f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
                         )
+                        if table.rows:
+                            page_tables.append([list(r) for r in table.rows])
                 continue
 
         # For non-PDF or unsplit files, attempt to crop before analysis.
@@ -218,9 +230,11 @@ def _collect_ocr_rows(
                 f"[OCR][TABLE] file_idx={file_idx} table_idx={table_idx} page={page_display} "
                 f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
             )
+            if table.rows:
+                page_tables.append([list(r) for r in table.rows])
     if cover_pages and skipped_any and not merged_rows:
         log("[STEP1][WARN] coverPages により全ページスキップ (テーブル無し)")
-    return merged_rows
+    return merged_rows, page_tables
 
 
 def process_order(
@@ -295,16 +309,75 @@ def process_order(
         cover_pages = 0
         _log("[CFG] coverPages default(=0)")
 
-    merged_rows = _collect_ocr_rows(analyzer, ocr_files, cover_pages, _log, center_conf=center_conf)
+    merged_rows, page_tables = _collect_ocr_rows(analyzer, ocr_files, cover_pages, _log, center_conf=center_conf)
     _log(f"[OCR] rows={len(merged_rows)} cols={(len(merged_rows[0]) if merged_rows else 0)}")
 
-    match_table = build_matching_table(
-        merged_rows,
-        center_conf=center_conf,
-        log_fn=_log,
-    )
-    processed_rows = match_table.rows
-    row_map = match_table.row_map
+    # Page-scoped matching: run matching per page/table, then unify columns by majority and merge.
+    page_results: List[Tuple[List[List[str]], List[int]]] = []  # (rows, row_map)
+    for pi, page_rows in enumerate(page_tables):
+        try:
+            mt = build_matching_table(page_rows, center_conf=center_conf, log_fn=_log)
+            page_results.append((mt.rows, mt.row_map))
+        except Exception:
+            logger.exception(f"matching failed on page unit {pi}")
+            # Fallback: keep raw page_rows as-is with dummy row_map
+            # Ensure '成分表'と'見本'列が無ければ追加
+            header = list(page_rows[0]) if page_rows else []
+            if header:
+                if "成分表" not in header:
+                    header.append("成分表")
+                if "見本" not in header:
+                    header.append("見本")
+            data = [list(r) + ([""] * (len(header) - len(r)) if len(r) < len(header) else list(r)[: len(header)]) for r in page_rows[1:]] if header else []
+            page_results.append(([header] + data if header else [] , list(range(1, len(data) + 1))))
+
+    # Decide target column count by majority vote across page headers
+    from collections import Counter
+    col_counts = [len(pr[0][0]) for pr in page_results if pr and pr[0]]
+    target_cols = col_counts and Counter(col_counts).most_common(1)[0][0] or 0
+    if target_cols:
+        _log(f"[POST][COLS] page_headers={col_counts} majority={target_cols}")
+
+    # Normalize each page to target column count (pad or truncate), then merge
+    processed_rows: List[List[str]] = []
+    combined_row_map: List[int] = []
+    global_row_counter = 0
+    header_written_global = False
+    for pr_rows, pr_map in page_results:
+        if not pr_rows:
+            continue
+        header = list(pr_rows[0])
+        data = [list(r) for r in pr_rows[1:]]
+        # normalize header and rows
+        def _norm_len(row: List[str]) -> List[str]:
+            if target_cols <= 0:
+                return row
+            if len(row) < target_cols:
+                return row + [""] * (target_cols - len(row))
+            elif len(row) > target_cols:
+                return row[:target_cols]
+            return row
+
+        header_n = _norm_len(header)
+        data_n = [_norm_len(r) for r in data]
+        if not header_written_global:
+            processed_rows = [header_n]
+            header_written_global = True
+        # append data
+        processed_rows.extend(data_n)
+        # row_map: append sequential indices to match data rows length
+        # Append global sequential indices across all pages (1..total_rows)
+        for _ in data_n:
+            global_row_counter += 1
+            combined_row_map.append(global_row_counter)
+
+    # If everything failed, fall back to running matching once on merged_rows
+    if not processed_rows:
+        mt = build_matching_table(merged_rows, center_conf=center_conf, log_fn=_log)
+        processed_rows = mt.rows
+        combined_row_map = mt.row_map
+
+    row_map = combined_row_map
     _log(f"[POST] processed_rows={len(processed_rows)} row_map={len(row_map)}")
 
     # --- 新仕様: 最初の列が空の行はスキップし、有効行のみを1..Nで再番号化する ---
@@ -321,13 +394,26 @@ def process_order(
             row_map = list(range(1, len(orig_data) + 1))
         orig_indexed = list(zip(row_map, orig_data))
         filtered_indexed: List[Tuple[int, List[str]]] = []
+        skipped_blank = 0
+        skipped_unselected = 0
         for orig_idx, row in orig_indexed:
             try:
                 first_col = row[0] if row else ""
             except Exception:
                 first_col = ""
-            if isinstance(first_col, str) and first_col.strip():
-                filtered_indexed.append((orig_idx, row))
+            val = ""
+            if isinstance(first_col, str):
+                val = first_col.strip()
+            # Skip when first column is empty
+            if not val:
+                skipped_blank += 1
+                continue
+            # Skip special DI placeholder ':unselected:' (or 'unselected') in first column
+            low = val.lower()
+            if low == ":unselected:" or low == "unselected":
+                skipped_unselected += 1
+                continue
+            filtered_indexed.append((orig_idx, row))
 
         # 新しいヘッダを先頭に付け、行番号を 1 から付与する
         new_header = ["行番号"] + orig_header
@@ -337,6 +423,10 @@ def process_order(
             filtered_orig_indices.append(orig_idx)
 
         processed_rows = new_rows
+        if skipped_blank or skipped_unselected:
+            _log(
+                f"[POST][FILTER] skipped blank_first_col={skipped_blank} unselected_first_col={skipped_unselected}"
+            )
     else:
         filtered_orig_indices = []
     # --- ここまで ---

@@ -29,7 +29,7 @@
   "nutrition": {
     "module": [1],
     "col": ["銘柄·条件", "銘柄・条件", "銘柄条件"],
-    "matching": ["配合表", "合表"]
+    "matching_all": ["配合表", "合表"]
   },
   "sample": {
     "module": [1],

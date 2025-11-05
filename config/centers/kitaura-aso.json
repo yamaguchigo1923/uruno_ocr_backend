@@ -29,11 +29,11 @@
   "nutrition": {
     "module": [1],
     "col": ["備考", "備 考"],
-    "matching_part": ["容表", "成分表"]
+    "matching_all": ["容表", "成分表"]
   },
   "sample": {
     "module": [1],
     "col": ["備考", "備 考"],
-    "matching": ["サンプル", "見本"]
+    "matching_all": ["サンプル", "見本", "本提出"]
   }
 }
