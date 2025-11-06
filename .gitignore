@@ -1,14 +1,64 @@
+### Candidate B: strict ignore for backend ###
+
+# Virtual environments
 .venv/
 venv/
 env/
+
+# Python caches/artifacts
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+
+# Tool caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.ipynb_checkpoints/
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+run.log
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+pytestdebug.log
+
+# Environment and secrets
 .env
 .env.*
 *.env
+!.env.example
 service-account.json
-.vscode/
-.idea/
+
+# Costs/telemetry
+config/llm_cost.txt
+
+# Data (keep folder tracked via .gitkeep)
+data/**
+!data/.gitkeep
+
+# Test outputs and generated artifacts
+test/**/output/**
+!test/**/output/.gitkeep
+test/**/result_*.csv
+test/**/di_page_*.csv
+test/**/di_all.csv
+test/**/llm_page_*.csv
+test/**/llm_all.csv
+
+# Temp files
+tmp/
+temp/
+*.tmp

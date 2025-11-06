@@ -5,6 +5,7 @@ uvicorn[standard]
 python-multipart
 azure-core
 azure-ai-documentintelligence
+openai>=1.51.0
 google-api-python-client
 google-auth
 google-auth-httplib2
@@ -16,4 +17,3 @@ python-dotenv
 pillow
 pymupdf
 opencv-python
-pytesseract

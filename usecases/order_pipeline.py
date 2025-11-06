@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from datetime import datetime
 
 from config.centers.loader import get_center_config
 from config.settings import get_settings
 from services.excel_alignment import current_month_jst, infer_center_metadata, read_reference_table
 from services.google_clients import get_google_clients
-from services.ocr_client import DocumentAnalyzer, TableBlock
-from services.matching_module.engine import build_matching_table
+from services.llm_table_extractor import LLMExtractionError, LLMTableExtractor
 from services.sheet_generator import SheetGenerator
 from services.image_preprocessing import crop_image_bytes, _pdf_bytes_to_images
 from utils.logger import get_logger
@@ -35,206 +35,120 @@ class OrderPipelineResult:
     debug_logs: List[str]
 
 
-def _append_table_rows(
-    merged_rows: List[List[str]],
-    table: TableBlock,
-    header_written: bool,
-) -> Tuple[bool, int]:
-    if not table.rows:
-        return header_written, 0
-    if not header_written:
-        merged_rows.extend(table.rows)
-        return True, table.row_count
-    body = table.rows[1:] if table.row_count > 1 else []
-    merged_rows.extend(body)
-    appended = table.row_count - 1 if table.row_count > 1 else 0
-    return header_written, appended
-
-
-def _collect_ocr_rows(
-    analyzer: DocumentAnalyzer,
+def _collect_llm_image_inputs(
     ocr_files: Sequence[Tuple[str, bytes]],
     cover_pages: int,
     log: Callable[[str], None],
     center_conf: dict | None = None,
-) -> Tuple[List[List[str]], List[List[List[str]]]]:
-    """Collect OCR rows and also keep per-page tables for page-scoped matching.
+) -> List[Dict[str, Any]]:
+    """Prepare per-page image payloads for LLM-based table reconstruction."""
 
-    Returns a tuple: (merged_rows, page_tables)
-      - merged_rows: single header then all body rows across pages (legacy behavior)
-      - page_tables: list of tables per page/table, each including its own header as rows[0]
-    """
-    merged_rows: List[List[str]] = []
-    page_tables: List[List[List[str]]] = []
+    page_images: List[Dict[str, Any]] = []
     cover_pages_remaining = max(0, cover_pages)
-    header_written = False
-    skipped_any = False
-    log(f"[STEP1] OCR start total_files={len(ocr_files)} (coverPages はページ単位)")
-    # Crop configuration (fractions 0.0-1.0). If not provided, default to 0s.
     crop_conf = center_conf.get("crop") if isinstance(center_conf, dict) else {}
     top_pct = float(crop_conf.get("top_pct", 0.0) or 0.0)
     bottom_pct = float(crop_conf.get("bottom_pct", 0.0) or 0.0)
     left_pct = float(crop_conf.get("left_pct", 0.0) or 0.0)
     right_pct = float(crop_conf.get("right_pct", 0.0) or 0.0)
-    log(f"[CFG][CROP] top={top_pct} bottom={bottom_pct} left={left_pct} right={right_pct}")
+    log(
+        f"[LLM][IMG] start files={len(ocr_files)} crop=({top_pct},{bottom_pct},{left_pct},{right_pct})"
+    )
+
+    def _encode_png(image_bytes: bytes) -> str:
+        return base64.b64encode(image_bytes).decode("ascii")
+
     for file_idx, (filename, content) in enumerate(ocr_files):
         base_name = Path(filename or f"file_{file_idx}").name
         is_pdf = base_name.lower().endswith(".pdf")
-        split_pages = analyzer.split_pdf_pages(content) if is_pdf else None
-        if split_pages:
+        try:
+            page_bytes_list = _pdf_bytes_to_images(content) if is_pdf else None
+        except Exception as exc:
+            log(f"[LLM][IMG][WARN] pdf_render_failed file_idx={file_idx}: {exc}")
+            page_bytes_list = None
+
+        if page_bytes_list:
             log(
-                f"[PDF][SPLIT] file_idx={file_idx} pages={len(split_pages)} coverRemaining={cover_pages_remaining}"
+                f"[LLM][IMG][PDF] file_idx={file_idx} pages={len(page_bytes_list)} coverRemaining={cover_pages_remaining}"
             )
-            for page_i, page_bytes in enumerate(split_pages, start=1):
+            for page_i, page_bytes in enumerate(page_bytes_list, start=1):
                 if cover_pages_remaining > 0:
                     cover_pages_remaining -= 1
-                    skipped_any = True
                     log(
-                        f"[COVER][SKIP-PAGE] file_idx={file_idx} page={page_i} remaining={cover_pages_remaining}"
+                        f"[LLM][IMG][COVER] file_idx={file_idx} page={page_i} skip remaining={cover_pages_remaining}"
                     )
                     continue
-                # page_bytes may be a single-page PDF; render to image bytes if possible
                 try:
-                    imgs = _pdf_bytes_to_images(page_bytes)
-                    page_img_bytes = imgs[0] if imgs else page_bytes
-                except Exception:
-                    page_img_bytes = page_bytes
-
-                # Apply cropping to the page image bytes (no-op if all zero)
-                try:
-                    log(f"[CROP][PAGE] file_idx={file_idx} page={page_i} applying crop")
-                    cropped_bytes, _, _ = crop_image_bytes(
-                        page_img_bytes, top_pct=top_pct, bottom_pct=bottom_pct, left_pct=left_pct, right_pct=right_pct, out_format="PNG"
+                    cropped_bytes, width, height = crop_image_bytes(
+                        page_bytes,
+                        top_pct=top_pct,
+                        bottom_pct=bottom_pct,
+                        left_pct=left_pct,
+                        right_pct=right_pct,
+                        out_format="PNG",
                     )
-                    log(f"[CROP][PAGE] file_idx={file_idx} page={page_i} crop applied")
                 except Exception as exc:
-                    log(f"[CROP][PAGE][WARN] file_idx={file_idx} page={page_i} crop failed: {exc}")
-                    cropped_bytes = page_img_bytes
-
-                analyzed = analyzer.analyze_content(cropped_bytes)
-                log(
-                    f"[OCR][PAGE] file_idx={file_idx} page={page_i} tables={len(analyzed.tables)}"
+                    log(f"[LLM][IMG][WARN] crop_failed file_idx={file_idx} page={page_i}: {exc}")
+                    cropped_bytes = page_bytes
+                    width = height = None
+                page_images.append(
+                    {
+                        "file_index": file_idx,
+                        "file_name": base_name,
+                        "page": page_i,
+                        "image_base64": _encode_png(cropped_bytes),
+                        "width": width,
+                        "height": height,
+                    }
                 )
-                for table_idx, table in enumerate(analyzed.tables):
-                    page_display = table.page_number if table.page_number is not None else page_i
-                    header_written, appended_rows = _append_table_rows(merged_rows, table, header_written)
-                    log(
-                        f"[OCR][TABLE] file_idx={file_idx} page={page_display} table_idx={table_idx} "
-                        f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
-                    )
-                    # keep per-page table with its own header
-                    if table.rows:
-                        page_tables.append([list(r) for r in table.rows])
+                log(
+                    f"[LLM][IMG][PAGE] file_idx={file_idx} page={page_i} width={width} height={height}"
+                )
             continue
 
-        # If PDF but cannot split (e.g., PyPDF2 not installed), render all pages and crop/analyze per page
         if is_pdf:
-            try:
-                imgs = _pdf_bytes_to_images(content)
-            except Exception as exc:
-                log(f"[PDF][RENDER][WARN] file_idx={file_idx} render failed: {exc}")
-                imgs = []
-            if imgs:
-                log(
-                    f"[PDF][RENDER] file_idx={file_idx} pages={len(imgs)} coverRemaining={cover_pages_remaining}"
-                )
-                for page_i, page_img_bytes in enumerate(imgs, start=1):
-                    if cover_pages_remaining > 0:
-                        cover_pages_remaining -= 1
-                        skipped_any = True
-                        log(
-                            f"[COVER][SKIP-PAGE] file_idx={file_idx} page={page_i} remaining={cover_pages_remaining}"
-                        )
-                        continue
-                    try:
-                        log(f"[CROP][PAGE] file_idx={file_idx} page={page_i} applying crop")
-                        cropped_bytes, _, _ = crop_image_bytes(
-                            page_img_bytes, top_pct=top_pct, bottom_pct=bottom_pct, left_pct=left_pct, right_pct=right_pct, out_format="PNG"
-                        )
-                        log(f"[CROP][PAGE] file_idx={file_idx} page={page_i} crop applied")
-                    except Exception as exc:
-                        log(f"[CROP][PAGE][WARN] file_idx={file_idx} page={page_i} crop failed: {exc}")
-                        cropped_bytes = page_img_bytes
-
-                    analyzed = analyzer.analyze_content(cropped_bytes)
-                    log(
-                        f"[OCR][PAGE] file_idx={file_idx} page={page_i} tables={len(analyzed.tables)}"
-                    )
-                    for table_idx, table in enumerate(analyzed.tables):
-                        page_display = table.page_number if table.page_number is not None else page_i
-                        header_written, appended_rows = _append_table_rows(merged_rows, table, header_written)
-                        log(
-                            f"[OCR][TABLE] file_idx={file_idx} page={page_display} table_idx={table_idx} "
-                            f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
-                        )
-                        if table.rows:
-                            page_tables.append([list(r) for r in table.rows])
-                continue
-
-        # For non-PDF or unsplit files, attempt to crop before analysis.
-        try:
-            cropped_content = content
-            # If this is likely an image, crop bytes; otherwise leave as-is.
-            if not is_pdf:
-                try:
-                    log(f"[CROP][FILE] file_idx={file_idx} applying crop to image file")
-                    cropped_content, _, _ = crop_image_bytes(
-                        content, top_pct=top_pct, bottom_pct=bottom_pct, left_pct=left_pct, right_pct=right_pct, out_format="PNG"
-                    )
-                    log(f"[CROP][FILE] file_idx={file_idx} crop applied to image file")
-                except Exception as exc:
-                    log(f"[CROP][FILE][WARN] file_idx={file_idx} crop failed: {exc}")
-                    cropped_content = content
-        except Exception:
-            cropped_content = content
-
-        analyzed = analyzer.analyze_content(cropped_content)
-        page_count = analyzed.page_count
-        tables = analyzed.tables
-        log(
-            f"[OCR][FILE] idx={file_idx} path={base_name} pdf={is_pdf} pages={page_count} "
-            f"tables={len(tables)} coverRemaining={cover_pages_remaining}"
-        )
-        if not tables:
-            continue
-        # If cover_pages_remaining would skip the whole file, be conservative:
-        # - If this is the only uploaded file, don't skip it (users often upload a single image)
-        # - Otherwise behave as before and consume pages
-        if cover_pages_remaining >= page_count:
-            if len(ocr_files) == 1:
-                # Single-file run: avoid skipping the only file. Log decision and continue processing.
-                log(
-                    f"[COVER][SKIP-AVOID] single-file run; coverPages={cover_pages} would skip this file but we keep it"
-                )
-            else:
-                cover_pages_remaining -= page_count
-                skipped_any = True
-                log(
-                    f"[COVER][SKIP-FILE] file_idx={file_idx} skip_pages={page_count} remaining={cover_pages_remaining}"
-                )
-                continue
-        skip_pages: set[int] = set()
-        if cover_pages_remaining > 0:
-            skip_pages = set(range(1, cover_pages_remaining + 1))
-            cover_pages_remaining = 0
-            log(f"[COVER][PARTIAL] file_idx={file_idx} skip_pages={sorted(skip_pages)}")
-        for table_idx, table in enumerate(tables):
-            page_no = table.page_number
-            if page_no in skip_pages:
-                skipped_any = True
-                log(f"[COVER][SKIP] file_idx={file_idx} table_idx={table_idx} page={page_no}")
-                continue
-            header_written, appended_rows = _append_table_rows(merged_rows, table, header_written)
-            page_display = page_no if page_no is not None else "None"
             log(
-                f"[OCR][TABLE] file_idx={file_idx} table_idx={table_idx} page={page_display} "
-                f"rows={table.row_count} cols={table.column_count} appended_rows={appended_rows}"
+                f"[LLM][IMG][WARN] pdf_no_pages file_idx={file_idx}; treating as single image"
             )
-            if table.rows:
-                page_tables.append([list(r) for r in table.rows])
-    if cover_pages and skipped_any and not merged_rows:
-        log("[STEP1][WARN] coverPages により全ページスキップ (テーブル無し)")
-    return merged_rows, page_tables
+
+        if cover_pages_remaining > 0:
+            cover_pages_remaining -= 1
+            log(
+                f"[LLM][IMG][COVER] file_idx={file_idx} skip entire file remaining={cover_pages_remaining}"
+            )
+            continue
+
+        try:
+            cropped_bytes, width, height = crop_image_bytes(
+                content,
+                top_pct=top_pct,
+                bottom_pct=bottom_pct,
+                left_pct=left_pct,
+                right_pct=right_pct,
+                out_format="PNG",
+            )
+        except Exception as exc:
+            log(f"[LLM][IMG][WARN] crop_failed file_idx={file_idx}: {exc}")
+            cropped_bytes = content
+            width = height = None
+
+        page_images.append(
+            {
+                "file_index": file_idx,
+                "file_name": base_name,
+                "page": 1,
+                "image_base64": _encode_png(cropped_bytes),
+                "width": width,
+                "height": height,
+            }
+        )
+        log(
+            f"[LLM][IMG][FILE] file_idx={file_idx} width={width} height={height}"
+        )
+
+    log(f"[LLM][IMG] total_pages={len(page_images)}")
+    return page_images
+
+
 
 
 def process_order(
@@ -248,7 +162,6 @@ def process_order(
 ) -> OrderPipelineResult:
     settings = get_settings()
     center_conf = get_center_config(center_id) or {}
-    analyzer = DocumentAnalyzer(settings)
     google_clients = get_google_clients(settings)
     sheet_generator = SheetGenerator(settings, google_clients)
     debug_logs: List[str] = []
@@ -309,78 +222,59 @@ def process_order(
         cover_pages = 0
         _log("[CFG] coverPages default(=0)")
 
-    merged_rows, page_tables = _collect_ocr_rows(analyzer, ocr_files, cover_pages, _log, center_conf=center_conf)
-    _log(f"[OCR] rows={len(merged_rows)} cols={(len(merged_rows[0]) if merged_rows else 0)}")
+    page_images = _collect_llm_image_inputs(ocr_files, cover_pages, _log, center_conf=center_conf)
+    if not page_images:
+        raise RuntimeError("LLM処理用のページ画像が生成できませんでした")
+    _log(f"[LLM][IMG] collected_pages={len(page_images)}")
 
-    # Page-scoped matching: run matching per page/table, then unify columns by majority and merge.
-    page_results: List[Tuple[List[List[str]], List[int]]] = []  # (rows, row_map)
-    for pi, page_rows in enumerate(page_tables):
-        try:
-            mt = build_matching_table(page_rows, center_conf=center_conf, log_fn=_log)
-            page_results.append((mt.rows, mt.row_map))
-        except Exception:
-            logger.exception(f"matching failed on page unit {pi}")
-            # Fallback: keep raw page_rows as-is with dummy row_map
-            # Ensure '成分表'と'見本'列が無ければ追加
-            header = list(page_rows[0]) if page_rows else []
-            if header:
-                if "成分表" not in header:
-                    header.append("成分表")
-                if "見本" not in header:
-                    header.append("見本")
-            data = [list(r) + ([""] * (len(header) - len(r)) if len(r) < len(header) else list(r)[: len(header)]) for r in page_rows[1:]] if header else []
-            page_results.append(([header] + data if header else [] , list(range(1, len(data) + 1))))
-
-    # Decide target column count by majority vote across page headers
-    from collections import Counter
-    col_counts = [len(pr[0][0]) for pr in page_results if pr and pr[0]]
-    target_cols = col_counts and Counter(col_counts).most_common(1)[0][0] or 0
-    if target_cols:
-        _log(f"[POST][COLS] page_headers={col_counts} majority={target_cols}")
-
-    # Normalize each page to target column count (pad or truncate), then merge
     processed_rows: List[List[str]] = []
-    combined_row_map: List[int] = []
-    global_row_counter = 0
-    header_written_global = False
-    for pr_rows, pr_map in page_results:
-        if not pr_rows:
-            continue
-        header = list(pr_rows[0])
-        data = [list(r) for r in pr_rows[1:]]
-        # normalize header and rows
-        def _norm_len(row: List[str]) -> List[str]:
-            if target_cols <= 0:
-                return row
-            if len(row) < target_cols:
-                return row + [""] * (target_cols - len(row))
-            elif len(row) > target_cols:
-                return row[:target_cols]
-            return row
+    row_map: List[int] = []
 
-        header_n = _norm_len(header)
-        data_n = [_norm_len(r) for r in data]
-        if not header_written_global:
-            processed_rows = [header_n]
-            header_written_global = True
-        # append data
-        processed_rows.extend(data_n)
-        # row_map: append sequential indices to match data rows length
-        # Append global sequential indices across all pages (1..total_rows)
-        for _ in data_n:
-            global_row_counter += 1
-            combined_row_map.append(global_row_counter)
+    llm_conf = center_conf.get("llm") if isinstance(center_conf, dict) else None
+    data_rows_accum: List[List[str]] = []
+    header_cols: List[str] = []
 
-    # If everything failed, fall back to running matching once on merged_rows
-    if not processed_rows:
-        mt = build_matching_table(merged_rows, center_conf=center_conf, log_fn=_log)
-        processed_rows = mt.rows
-        combined_row_map = mt.row_map
+    if isinstance(llm_conf, dict) and llm_conf.get("enabled", True):
+        extractor = LLMTableExtractor(settings)
+        if extractor.is_available:
+            total_pages = len(page_images)
+            _log(f"[LLM][MODE] per-page processing pages={total_pages}")
+            for idx, page in enumerate(page_images, start=1):
+                try:
+                    meta = {
+                        "source": "vision",
+                        "image_count": 1,
+                        "pages": [page.get("page")],
+                    }
+                    result = extractor.extract(
+                        tables=None,
+                        images=[page],
+                        center_conf=center_conf,
+                        center_id=center_conf.get("id") if isinstance(center_conf, dict) else None,
+                        log_fn=_log,
+                        meta=meta,
+                    )
+                    if not header_cols:
+                        header_cols = list(result.header)
+                    # append rows only (skip header beyond the first page)
+                    data_rows_accum.extend(result.data_rows)
+                    _log(f"[LLM][PAGE] {idx}/{total_pages} rows+={len(result.data_rows)} total={len(data_rows_accum)}")
+                except LLMExtractionError as exc:
+                    _log(f"[LLM][ERROR][PAGE] {idx}/{total_pages} {exc}")
+                except Exception:
+                    logger.exception("LLM extraction failed (per-page)")
+                    _log(f"[LLM][ERROR][PAGE] {idx}/{total_pages} unexpected failure")
+        else:
+            _log("[LLM] skipped (Azure OpenAI not configured)")
 
-    row_map = combined_row_map
+    if not data_rows_accum or not header_cols:
+        raise RuntimeError("LLMによる表抽出に失敗しました。センター設定や画像を確認してください。")
+
+    processed_rows = [header_cols] + data_rows_accum
+    row_map = list(range(1, len(data_rows_accum) + 1))
     _log(f"[POST] processed_rows={len(processed_rows)} row_map={len(row_map)}")
 
-    # --- 新仕様: 最初の列が空の行はスキップし、有効行のみを1..Nで再番号化する ---
+    # --- 新仕様: 行全体が空白の行のみスキップし、有効行のみを1..Nで再番号化する ---
     # processed_rows は header を先頭に持つテーブル形式を想定します。
     # オリジナルの行インデックス (ref_table と対応するための index) を保持し、
     # 参照テーブル参照時はそのオリジナル index を使います。
@@ -394,24 +288,23 @@ def process_order(
             row_map = list(range(1, len(orig_data) + 1))
         orig_indexed = list(zip(row_map, orig_data))
         filtered_indexed: List[Tuple[int, List[str]]] = []
-        skipped_blank = 0
-        skipped_unselected = 0
+        skipped_empty = 0
+        skipped_indices: List[int] = []
         for orig_idx, row in orig_indexed:
+            # 行全体が空白（全セルが空/空白）の場合のみスキップ
             try:
-                first_col = row[0] if row else ""
+                is_empty_row = True
+                for c in row:
+                    s = ("" if c is None else str(c)).strip()
+                    if s:
+                        is_empty_row = False
+                        break
             except Exception:
-                first_col = ""
-            val = ""
-            if isinstance(first_col, str):
-                val = first_col.strip()
-            # Skip when first column is empty
-            if not val:
-                skipped_blank += 1
-                continue
-            # Skip special DI placeholder ':unselected:' (or 'unselected') in first column
-            low = val.lower()
-            if low == ":unselected:" or low == "unselected":
-                skipped_unselected += 1
+                # 万一評価に失敗した場合は安全側で非空扱い
+                is_empty_row = False
+            if is_empty_row:
+                skipped_empty += 1
+                skipped_indices.append(orig_idx)
                 continue
             filtered_indexed.append((orig_idx, row))
 
@@ -423,9 +316,10 @@ def process_order(
             filtered_orig_indices.append(orig_idx)
 
         processed_rows = new_rows
-        if skipped_blank or skipped_unselected:
+        if skipped_empty:
+            preview = skipped_indices[:10]
             _log(
-                f"[POST][FILTER] skipped blank_first_col={skipped_blank} unselected_first_col={skipped_unselected}"
+                f"[POST][FILTER] skipped empty_rows={skipped_empty} indices_sample={preview}"
             )
     else:
         filtered_orig_indices = []
