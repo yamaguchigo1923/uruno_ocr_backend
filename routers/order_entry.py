@@ -194,6 +194,9 @@ async def order_entry_stream(
                     "flags": result.flags,
                     "ocr_snapshot_url": result.ocr_snapshot_url,
                     "output_spreadsheet_url": result.output_spreadsheet_url,
+                    "output_folder_id": result.output_folder_id,
+                    "extraction_sheet_id": result.extraction_sheet_id,
+                    "extraction_sheet_url": result.extraction_sheet_url,
                     "center_name": result.center_name,
                     "center_month": result.center_month,
                     "debug_logs": filtered,
@@ -263,6 +266,8 @@ async def export_documents(payload: ExportRequest) -> ExportResponse:
             flags=payload.flags,
             center_name=payload.center_name,
             center_month=payload.center_month,
+            extraction_sheet_id=payload.extraction_sheet_id,
+            output_folder_id=payload.output_folder_id,
         )
     except Exception as exc:  # pragma: no cover - Google API errors
         logger.exception("document export failed")
@@ -310,6 +315,8 @@ async def export_documents_stream(payload: ExportRequest):
                 flags=payload.flags,
                 center_name=payload.center_name,
                 center_month=payload.center_month,
+                extraction_sheet_id=payload.extraction_sheet_id,
+                output_folder_id=payload.output_folder_id,
                 log_fn=log_fn,
             )
             try:

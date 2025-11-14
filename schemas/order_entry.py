@@ -33,6 +33,8 @@ class ExportRequest(BaseModel):
     maker_data: Dict[str, List[List[str]]]
     maker_cds: Dict[str, List[str]]
     flags: List[List[str]]
+    extraction_sheet_id: Optional[str] = None
+    output_folder_id: Optional[str] = None
 
 
 class ExportResponse(BaseModel):

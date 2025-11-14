@@ -43,8 +43,33 @@ def read_reference_table(file_bytes: bytes, filename: str) -> ReferenceTable:
         return []
     if df.empty:
         return []
-    df = df[df.iloc[:, 0].notna() & df.iloc[:, 0].astype(str).str.strip().astype(bool)]
-    df = df.reset_index(drop=True).fillna("").astype(str)
+    # すべてのセルを文字列にし、欠損は空文字へ
+    df = df.fillna("").astype(str)
+
+    # 行全体が空（全セルが空白 or 空文字）の判定用にトリムしたビューを作成
+    # applymap は将来廃止予定のため、列ごとの str.strip を用いる
+    trimmed = df.apply(lambda col: col.astype(str).str.strip())
+    empty_row = trimmed.apply(lambda r: all(cell == "" for cell in r), axis=1)
+
+    # 2行連続の空行が現れたら、その直前までを有効データとみなす
+    cutoff_idx: int | None = None
+    if len(empty_row) >= 2:
+        for i in range(len(empty_row) - 1):
+            if bool(empty_row.iat[i]) and bool(empty_row.iat[i + 1]):
+                cutoff_idx = i  # i の直前までがデータ
+                break
+
+    if cutoff_idx is not None:
+        df = df.iloc[:cutoff_idx]
+        trimmed = trimmed.iloc[:cutoff_idx]
+        empty_row = trimmed.apply(lambda r: all(cell == "" for cell in r), axis=1)
+
+    # 行全体が空の行は除外（先頭列が空でも他列に値があれば残す）
+    if len(empty_row) > 0:
+        df = df[~empty_row].reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+
     table: ReferenceTable = [df.columns.tolist()]
     table.extend(df.values.tolist())
     return table

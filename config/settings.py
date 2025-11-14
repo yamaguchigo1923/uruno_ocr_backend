@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     aoai_deployment: str | None = Field(None, env="AOAI_DEPLOYMENT")
     aoai_api_version: str | None = Field(None, env="AOAI_API_VERSION")
 
+    # Irregular destination list (依頼先のイレギュラー一覧)
+    irregular_dest_spreadsheet_id: str | None = Field(None, env="IRREGULAR_DEST_SPREADSHEET_ID")
+    irregular_dest_gid: int | None = Field(None, env="IRREGULAR_DEST_GID")
+
     @field_validator("azure_endpoint", mode="before")
     def _normalize_endpoint(cls, value: str | None) -> str | None:  # noqa: N805 - pydantic requirement
         if not value:

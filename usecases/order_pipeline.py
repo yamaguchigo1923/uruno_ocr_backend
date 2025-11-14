@@ -30,6 +30,9 @@ class OrderPipelineResult:
     flags: List[List[str]]
     ocr_snapshot_url: Optional[str]
     output_spreadsheet_url: Optional[str]
+    output_folder_id: Optional[str]
+    extraction_sheet_id: Optional[str]
+    extraction_sheet_url: Optional[str]
     center_name: str
     center_month: str
     debug_logs: List[str]
@@ -398,10 +401,29 @@ def process_order(
         # Do not let debug hinting break the pipeline
         logger.exception("failed to emit match summary (post-renumber)")
 
+    # Step1 新仕様: フォルダ作成 (YYYYMMDD_centerId) し OCR結果と抽出結果シートを格納
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    jst_now = _dt.now(_tz(_td(hours=9)))
+    # フォルダ名: YYYYMMDDHHMM_centerId 形式（例: 202511141010_hitachinaka）
+    folder_title = f"{jst_now.strftime('%Y%m%d%H%M')}_{center_id}"
+    try:
+        output_folder_id = sheet_generator.create_folder(folder_title, settings.drive_folder_id)
+    except Exception:
+        output_folder_id = None
+        _log("[FOLDER][WARN] failed to create; fallback root")
     ocr_snapshot_url = ""
-    if processed_rows and sheet_name:
-        ocr_snapshot_url = sheet_generator.write_ocr_snapshot(sheet_name, processed_rows)
-        _flush_sheet_logs()
+    ocr_snapshot_sheet_id = None
+    if processed_rows:
+        try:
+            ocr_snapshot_sheet_id, ocr_snapshot_url = sheet_generator.write_rows_to_new_spreadsheet(
+                title=f"OCR結果_{int(_dt.now().timestamp())}_{center_id}",
+                rows=processed_rows,
+                folder_id=output_folder_id,
+                sheet_title="OCR結果",
+            )
+            _flush_sheet_logs()
+        except Exception:
+            _log("[OCR][WARN] snapshot spreadsheet creation failed")
 
     selections: Selections = []
     maker_cds: Dict[str, List[str]] = {}
@@ -481,6 +503,20 @@ def process_order(
         center_name = center_conf["displayName"] or center_name
     center_month = current_month_jst()
 
+    # 抽出結果シート作成 (人手修正用) flags_list を書き込み
+    extraction_sheet_id = None
+    extraction_sheet_url = None
+    if flags_list:
+        try:
+            extraction_sheet_id, extraction_sheet_url = sheet_generator.create_extraction_sheet(
+                center_id=center_id,
+                flags_list=flags_list,
+                folder_id=output_folder_id,
+            )
+            _flush_sheet_logs()
+        except Exception:
+            _log("[EXTRACT][WARN] create sheet failed")
+
     output_url = None
     if maker_data and generate_documents:
         output_url, doc_logs = sheet_generator.generate_documents(
@@ -491,11 +527,8 @@ def process_order(
             center_month=center_month,
             center_conf=center_conf,
             center_id=center_id,
+            output_folder_id=output_folder_id,
         )
-        # If we have wired sheet_generator.log_fn to stream logs in realtime,
-        # those same messages have already been appended to debug_logs via
-        # the _log callback, so avoid duplicating them here. Otherwise,
-        # include returned doc_logs for backward compatibility.
         if getattr(sheet_generator, "log_fn", None) is None:
             debug_logs.extend(doc_logs)
 
@@ -511,6 +544,9 @@ def process_order(
         flags=flags_list,
         ocr_snapshot_url=ocr_snapshot_url,
         output_spreadsheet_url=output_url,
+        output_folder_id=output_folder_id,
+        extraction_sheet_id=extraction_sheet_id,
+        extraction_sheet_url=extraction_sheet_url,
         center_name=center_name,
         center_month=center_month,
         debug_logs=debug_logs,
@@ -525,6 +561,8 @@ def export_order_documents(
     flags: List[List[str]],
     center_name: str,
     center_month: str,
+    extraction_sheet_id: Optional[str] = None,
+    output_folder_id: Optional[str] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Tuple[str, List[str]]:
     settings = get_settings()
@@ -538,13 +576,58 @@ def export_order_documents(
             sheet_generator.log_fn = log_fn  # type: ignore[attr-defined]
         except Exception:
             logger.exception("failed to set sheet_generator.log_fn for export")
-    url, debug_logs = sheet_generator.generate_documents(
-        maker_data,
-        maker_cds,
-        flags,
-        center_name=center_name,
-        center_month=center_month,
-        center_conf=center_conf,
-        center_id=center_id,
+    # 商品カタログ読み込み（共通）
+    catalog_range = (
+        center_conf.get("ranges", {}).get("catalog")
+        if isinstance(center_conf.get("ranges"), dict)
+        else None
+    ) or settings.catalog_range
+    catalog_template_id = center_conf.get("templateSpreadsheetId") or settings.template_spreadsheet_id
+    catalog = sheet_generator.load_product_catalog(catalog_template_id, catalog_range)
+
+    # 抽出結果シートが指定されていれば最新の flags を読み込む
+    if extraction_sheet_id:
+        try:
+            flags = sheet_generator.load_extraction_sheet(extraction_sheet_id)
+        except Exception:
+            logger.exception("failed to load extraction sheet; fallback to provided flags")
+
+    # flags: [依頼先, メーカー, 商品CD, 成分表, 見本]
+    # 依頼先ごとに maker_cds と maker_data を構築
+    dest_to_maker_cds: Dict[str, Dict[str, List[str]]] = {}
+    dest_to_flags: Dict[str, List[List[str]]] = {}
+    for dest, maker, code, s_flag, m_flag in flags:
+        dest_key = dest or maker or "メーカー名なし"
+        dest_to_flags.setdefault(dest_key, []).append([maker, code, s_flag, m_flag])
+        dest_maker_cds = dest_to_maker_cds.setdefault(dest_key, {})
+        dest_maker_cds.setdefault(maker, []).append(code)
+
+    # 1つのスプレッドシートファイルを作成し、その中に依頼先ごとのシートを作る
+    target_folder = output_folder_id or settings.drive_folder_id
+    sheet_generator.debug_events = []
+    title = f"依頼書出力_{int(datetime.now().timestamp())}"
+    spreadsheet_id, url = sheet_generator.create_output_spreadsheet(
+        title=title,
+        drive_folder_id=target_folder,
     )
+
+    debug_logs: List[str] = []
+    for dest, m_cds in dest_to_maker_cds.items():
+        m_data = sheet_generator.build_maker_rows(catalog, m_cds)
+        dest_flags = dest_to_flags.get(dest, [])
+        # 既存 generate_documents を流用して、同一ファイルにメーカー別シートを追加していく
+        _, logs_tmp = sheet_generator.generate_documents(
+            m_data,
+            m_cds,
+            dest_flags,
+            center_name=center_name,
+            center_month=center_month,
+            center_conf=center_conf,
+            center_id=center_id,
+            output_folder_id=target_folder,
+            existing_spreadsheet_id=spreadsheet_id,
+            existing_url=url,
+        )
+        debug_logs.extend(logs_tmp)
+
     return url, debug_logs

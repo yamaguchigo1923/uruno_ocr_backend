@@ -15,7 +15,7 @@ logger = get_logger("services.sheet_generator")
 
 MakerData = Dict[str, List[List[str]]]
 MakerCodes = Dict[str, List[str]]
-FlagsList = List[List[str]]
+FlagsList = List[List[str]]  # [依頼先?, メーカー, 商品CD, 成分表フラグ, 見本フラグ] 形式を想定
 
 
 class SheetGenerator:
@@ -126,6 +126,210 @@ class SheetGenerator:
     # ------------------------------------------------------------------
     # Domain specific helpers
     # ------------------------------------------------------------------
+    def create_folder(self, title: str, parent_folder_id: Optional[str] = None) -> str:
+        """Drive 上に新規フォルダを作成しフォルダIDを返す。"""
+        body = {"name": title, "mimeType": "application/vnd.google-apps.folder"}
+        if parent_folder_id:
+            body["parents"] = [parent_folder_id]
+        res = self._execute_with_backoff(
+            self.clients.drive.files().create(body=body, supportsAllDrives=True, fields="id"),
+            label="files.create[folder]",
+        )
+        folder_id = res.get("id")
+        self._dbg(f"[FOLDER] created id={folder_id} title={title}")
+        return folder_id  # type: ignore[return-value]
+
+    def create_basic_spreadsheet(self, title: str, folder_id: Optional[str] = None) -> Tuple[str, str]:
+        body = {"name": title, "mimeType": "application/vnd.google-apps.spreadsheet"}
+        if folder_id:
+            body["parents"] = [folder_id]
+        new_ss = self._execute_with_backoff(
+            self.clients.drive.files().create(body=body, supportsAllDrives=True, fields="id"),
+            label="files.create[ss]",
+        )
+        spreadsheet_id = new_ss.get("id")
+        url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+        self._dbg(f"[SS] created id={spreadsheet_id} title={title}")
+        return spreadsheet_id, url
+
+    def write_rows_to_new_spreadsheet(
+        self,
+        title: str,
+        rows: List[List[str]],
+        *,
+        folder_id: Optional[str] = None,
+        sheet_title: str = "シート1",
+    ) -> Tuple[str, str]:
+        ss_id, url = self.create_basic_spreadsheet(title, folder_id)
+        # 初期シートのタイトル変更 (オプション)
+        try:
+            if sheet_title and sheet_title != "シート1":
+                meta = self._execute_with_backoff(
+                    self.clients.sheets.spreadsheets().get(spreadsheetId=ss_id, fields="sheets.properties"),
+                    label="spreadsheets.get[rename-init]",
+                )
+                first_id = meta["sheets"][0]["properties"]["sheetId"]
+                self._execute_with_backoff(
+                    self.clients.sheets.spreadsheets().batchUpdate(
+                        spreadsheetId=ss_id,
+                        body={"requests": [{"updateSheetProperties": {"properties": {"sheetId": first_id, "title": sheet_title}, "fields": "title"}}]},
+                    ),
+                    label="spreadsheets.batchUpdate[rename-init]",
+                )
+        except Exception:
+            pass
+        if rows:
+            self.update_values(ss_id, f"'{sheet_title}'!A1", rows, label="values.update[snapshot]")
+        return ss_id, url
+
+    def _get_sheet_title_by_gid(self, spreadsheet_id: str, sheet_gid: int) -> Optional[str]:
+        try:
+            meta = self._execute_with_backoff(
+                self.clients.sheets.spreadsheets().get(
+                    spreadsheetId=spreadsheet_id, fields="sheets.properties"
+                ),
+                label="spreadsheets.get[sheetTitle]",
+            )
+            for sh in meta.get("sheets", []):
+                props = sh.get("properties", {})
+                if props.get("sheetId") == sheet_gid:
+                    return props.get("title")
+        except Exception as exc:
+            self._dbg(f"[IRREGULAR][WARN] title by gid failed {exc}")
+        return None
+
+    def load_irregular_destinations(self) -> Tuple[Dict[str, str], Dict[Tuple[str, str], str]]:
+        """
+        Load irregular destination mappings.
+        Returns:
+            (maker_default_map, maker_code_map)
+            maker_default_map: {メーカー: 依頼先} for rows where 商品CD is empty
+            maker_code_map: {(メーカー, 商品CD_norm): 依頼先} for rows where 商品CD is present
+        """
+        s_id = getattr(self.settings, "irregular_dest_spreadsheet_id", None)
+        gid = getattr(self.settings, "irregular_dest_gid", None)
+        if not s_id or gid is None:
+            self._dbg("[IRREGULAR] not configured")
+            return {}, {}
+        title = self._get_sheet_title_by_gid(s_id, int(gid))
+        if not title:
+            self._dbg("[IRREGULAR][WARN] sheet title not found")
+            return {}, {}
+        rng = f"'{title}'!C3:E"  # C=メーカー, D=商品CD, E=依頼先
+        try:
+            res = self._execute_with_backoff(
+                self.clients.sheets.spreadsheets().values().get(
+                    spreadsheetId=s_id,
+                    range=rng,
+                    valueRenderOption="FORMATTED_VALUE",
+                ),
+                label="values.get[irregular]",
+            )
+            values = res.get("values", [])
+        except Exception as exc:
+            self._dbg(f"[IRREGULAR][WARN] load failed {exc}")
+            values = []
+        maker_default: Dict[str, str] = {}
+        maker_code: Dict[Tuple[str, str], str] = {}
+        for row in values:
+            maker = (row[0] if len(row) > 0 else "").strip()
+            if not maker:
+                break  # 終端: C列が空になったら以降はデータ無し
+            code = (row[1] if len(row) > 1 else "").strip()
+            dest = (row[2] if len(row) > 2 else "").strip()
+            if not dest:
+                continue
+            if not code:
+                if maker not in maker_default:
+                    maker_default[maker] = dest
+            else:
+                norm = code.lstrip("0") or "0"
+                maker_code[(maker, norm)] = dest
+                maker_code[(maker, code)] = dest
+        self._dbg(f"[IRREGULAR] default={len(maker_default)} specific={len(maker_code)}")
+        return maker_default, maker_code
+
+    def create_extraction_sheet(
+        self,
+        *,
+        center_id: str,
+        flags_list: FlagsList,
+        folder_id: Optional[str] = None,
+        title_prefix: str = "抽出結果",
+    ) -> Tuple[str, str]:
+        title = f"{title_prefix}_{int(time.time())}_{center_id}"
+        ss_id, url = self.create_basic_spreadsheet(title, folder_id)
+        header = ["依頼先", "メーカー", "商品CD", "成分表", "見本"]
+        rows = [header]
+        maker_default, maker_code = self.load_irregular_destinations()
+        for maker, code, s_flag, m_flag in flags_list:
+            maker_key = (maker or "").strip() or "メーカー名なし"
+            code_key = (code or "").strip()
+            code_norm = code_key.lstrip("0") or "0"
+            dest = maker_default.get(maker_key)
+            if dest is None:
+                dest = maker_code.get((maker_key, code_norm)) or maker_code.get((maker_key, code_key))
+            if not dest:
+                dest = maker_key
+            rows.append([dest, maker_key, code_key, s_flag, m_flag])
+        self.update_values(ss_id, "A1", rows, label="values.update[extraction]")
+        self._dbg(f"[EXTRACT] sheet id={ss_id} rows={len(rows)-1}")
+        return ss_id, url
+
+    def load_extraction_sheet(self, spreadsheet_id: str, sheet_name: Optional[str] = None) -> FlagsList:
+        rng = f"{sheet_name}!A1:Z" if sheet_name else "A1:Z"
+        res = self._execute_with_backoff(
+            self.clients.sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=rng,
+                valueRenderOption="FORMATTED_VALUE",
+            ),
+            label="values.get[extraction]",
+        )
+        values = res.get("values", [])
+        if not values:
+            return []
+        header = values[0]
+        # 依頼先列 (A列) はあってもなくても良い。あれば index を取っておく。
+        try:
+            dest_idx = header.index("依頼先")
+        except ValueError:
+            dest_idx = -1
+        try:
+            maker_idx = header.index("メーカー")
+            cd_idx = header.index("商品CD")
+        except ValueError:
+            self._dbg("[EXTRACT][WARN] header missing required columns")
+            return []
+        # 成分表/見本 の列名互換 (見本/サンプル)
+        try:
+            seibun_idx = header.index("成分表")
+        except ValueError:
+            seibun_idx = -1
+        sample_candidates = [c for c in ("見本", "サンプル") if c in header]
+        sample_idx = header.index(sample_candidates[0]) if sample_candidates else -1
+        out: FlagsList = []
+        for row in values[1:]:
+            if len(row) <= max(maker_idx, cd_idx):
+                continue
+            dest = (row[dest_idx] or "").strip() if dest_idx >= 0 and dest_idx < len(row) else ""
+            maker = (row[maker_idx] or "").strip()
+            code = (row[cd_idx] or "").strip()
+            if not maker and not code:
+                continue
+            s_flag = (row[seibun_idx].strip() if seibun_idx >= 0 and seibun_idx < len(row) else "") if seibun_idx >= 0 else ""
+            m_flag_raw = (row[sample_idx].strip() if sample_idx >= 0 and sample_idx < len(row) else "") if sample_idx >= 0 else ""
+            # 正規化: 成分表は "○" のみ、見本は "3" or "○" をそのまま保持
+            if s_flag not in {"", "○", "-"}:
+                s_flag = "○" if s_flag else ""
+            if m_flag_raw not in {"", "3", "○", "-"}:
+                # 人が編集した場合の緩和 (例: '◯')
+                m_flag = "3" if m_flag_raw == "3" else ("○" if m_flag_raw else "")
+            else:
+                m_flag = m_flag_raw
+            out.append([dest, (maker or "メーカー名なし"), code, s_flag, m_flag])
+        self._dbg(f"[EXTRACT] loaded rows={len(out)}")
+        return out
     def load_product_catalog(self, spreadsheet_id: str, a1_range: str) -> Dict[str, List[str]]:
         response = self._execute_with_backoff(
             self.clients.sheets.spreadsheets().values().get(
@@ -299,11 +503,14 @@ class SheetGenerator:
                     maker_val = row[1] if len(row) > 1 else maker
                     product_name = row[2] if len(row) > 2 else ""
                     spec = row[3] if len(row) > 3 else ""
+                    maker_product_cd = row[4] if len(row) > 4 else ""
+                    jan = row[5] if len(row) > 5 else ""
                     note = row[7] if len(row) > 7 else ""
-                    rows.append([maker_val, product_name, spec, note])
+                    # 行構成: [メーカー, 商品名, 規格, 備考, メーカー商品CD, JAN]
+                    rows.append([maker_val, product_name, spec, note, maker_product_cd, jan])
                 else:
                     miss += 1
-                    rows.append([maker, "", "", f"NOT_FOUND:{code}"])
+                    rows.append([maker, "", "", f"NOT_FOUND:{code}", "", ""])
             if miss:
                 self._dbg(f"[CATALOG][MISS] maker={maker} missing={miss}/{len(cds)}")
             maker_data[maker] = rows
@@ -359,15 +566,25 @@ class SheetGenerator:
         maker_cds: MakerCodes,
         flags_list: FlagsList,
         *,
+        doc_title: Optional[str] = None,
         center_name: str,
         center_month: str,
         center_conf: Dict,
         center_id: str,
+        output_folder_id: Optional[str] = None,
+        existing_spreadsheet_id: Optional[str] = None,
+        existing_url: Optional[str] = None,
     ) -> Tuple[str, List[str]]:
         center_conf = center_conf or {}
         self.debug_events = []
-        title = f"成分表出力_{int(time.time())}"
-        self._dbg(f"[STEP2] create {title} center_id={center_id}")
+        # 既存スプレッドシートが指定されている場合はそれを使う（シート追加のみ）
+        if existing_spreadsheet_id:
+            spreadsheet_id = existing_spreadsheet_id
+            url = existing_url or f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
+            self._dbg(f"[STEP2] reuse existing spreadsheet id={spreadsheet_id} center_id={center_id}")
+        else:
+            title = f"依頼書出力_{int(time.time())}"
+            self._dbg(f"[STEP2] create {title} center_id={center_id}")
         if os.environ.get("DRIVE_DIAG", "1") == "1":
             try:
                 sa_email = getattr(self.clients.credentials, "service_account_email", "UNKNOWN")
@@ -383,7 +600,7 @@ class SheetGenerator:
             except Exception as exc:
                 self._dbg(f"[STEP2][DIAG][WARN] about.get failed {exc}")
             try:
-                q = "name contains '成分表出力_' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
+                q = "name contains '依頼書出力_' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
                 res = self.clients.drive.files().list(
                     q=q,
                     pageSize=10,
@@ -396,11 +613,13 @@ class SheetGenerator:
             except Exception as exc:
                 self._dbg(f"[STEP2][DIAG][WARN] list failed {exc}")
 
-        spreadsheet_id, url = self.create_output_spreadsheet(
-            title=title,
-            drive_folder_id=self.settings.drive_folder_id,
-        )
-        self._dbg(f"[STEP2] new_id={spreadsheet_id}")
+        target_folder = output_folder_id or self.settings.drive_folder_id
+        if not existing_spreadsheet_id:
+            spreadsheet_id, url = self.create_output_spreadsheet(
+                title=title,
+                drive_folder_id=target_folder,
+            )
+            self._dbg(f"[STEP2] new_id={spreadsheet_id}")
 
         template_id_present = "templateSpreadsheetId" in center_conf
         template_sheet_id_present = "templateSheetId" in center_conf
@@ -438,131 +657,143 @@ class SheetGenerator:
 
         flags_map = {(maker, cd): (s_flag, m_flag) for maker, cd, s_flag, m_flag in flags_list}
 
-        existing_titles: set[str] = set()
-        for maker_index, (maker, rows) in enumerate(maker_data.items(), start=1):
+        # 依頼先ごとにシートは1枚とするため、maker_data 全体を1シートに書き出す
+        # 行をフラットにし、メーカー列を含めたまま1シートに展開する
+        all_rows: List[List[str]] = []
+        all_cds: List[str] = []
+        for maker, rows in maker_data.items():
             cds_for_maker = maker_cds.get(maker, [])
-            self._dbg(
-                f"[MK-SHEET] {maker_index}/{len(maker_data)} maker={maker} rows={len(rows)} cds={len(cds_for_maker)}"
-            )
-            copied = self._execute_with_backoff(
-                self.clients.sheets.spreadsheets().sheets().copyTo(
-                    spreadsheetId=template_id,
-                    sheetId=template_sheet_id,
-                    body={"destinationSpreadsheetId": spreadsheet_id},
-                ),
-                label="sheets.copyTo",
-            )
-            new_sheet_id = copied.get("sheetId")
-            safe_title = self._sanitize_title(maker or "メーカー名なし", existing_titles)
-            self._execute_with_backoff(
-                self.clients.sheets.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={
-                        "requests": [
-                            {
-                                "updateSheetProperties": {
-                                    "properties": {"sheetId": new_sheet_id, "title": safe_title},
-                                    "fields": "title",
-                                }
+            n = min(len(cds_for_maker), len(rows))
+            if n <= 0:
+                continue
+            cds_slice = cds_for_maker[:n]
+            rows_slice = rows[:n]
+            all_cds.extend(cds_slice)
+            all_rows.extend(rows_slice)
+
+        if not all_rows:
+            self._dbg("[MK-SHEET] no rows to write for this document")
+            return url, self.debug_events
+
+        copied = self._execute_with_backoff(
+            self.clients.sheets.spreadsheets().sheets().copyTo(
+                spreadsheetId=template_id,
+                sheetId=template_sheet_id,
+                body={"destinationSpreadsheetId": spreadsheet_id},
+            ),
+            label="sheets.copyTo",
+        )
+        new_sheet_id = copied.get("sheetId")
+        # シート名は依頼書タイトル（依頼先名など）を優先して使う
+        safe_title = self._sanitize_title(doc_title or center_name or "依頼書", set())
+        self._execute_with_backoff(
+            self.clients.sheets.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "updateSheetProperties": {
+                                "properties": {"sheetId": new_sheet_id, "title": safe_title},
+                                "fields": "title",
                             }
-                        ]
-                    },
-                ),
-                label="spreadsheets.batchUpdate[rename]",
+                        }
+                    ]
+                },
+            ),
+            label="spreadsheets.batchUpdate[rename]",
+        )
+
+        # ヘッダ情報（センター名・月）はシート共通
+        if center_name:
+            self.update_values(
+                spreadsheet_id,
+                f"'{safe_title}'!{center_name_rng}",
+                [[center_name] * 4],
+                label="values.update[センター名]",
             )
-            cds = maker_cds.get(maker, [])
-            n = min(len(cds), len(rows))
-            cds = cds[:n]
-            rows = rows[:n]
-
-            if maker:
-                self.update_values(
-                    spreadsheet_id,
-                    f"'{safe_title}'!{maker_header_rng}",
-                    [[maker] * 4],
-                    label="values.update[メーカー名]",
-                )
-            if center_name:
-                self.update_values(
-                    spreadsheet_id,
-                    f"'{safe_title}'!{center_name_rng}",
-                    [[center_name] * 4],
-                    label="values.update[センター名]",
-                )
-            if center_month:
-                self.update_values(
-                    spreadsheet_id,
-                    f"'{safe_title}'!{month_rng}",
-                    [[center_month]],
-                    label="values.update[月]",
-                )
-
-            header_row = start_row - 1
-            rng_header = f"'{safe_title}'!A{header_row}:Z{header_row}"
-            res_header = self._execute_with_backoff(
-                self.clients.sheets.spreadsheets().values().get(
-                    spreadsheetId=spreadsheet_id,
-                    range=rng_header,
-                    valueRenderOption="FORMATTED_VALUE",
-                ),
-                label="values.get[export-header]",
+        if center_month:
+            self.update_values(
+                spreadsheet_id,
+                f"'{safe_title}'!{month_rng}",
+                [[center_month]],
+                label="values.update[月]",
             )
-            header_vals = (res_header.get("values") or [[]])[0]
 
-            def col_letter(name: str, default_idx: int) -> str:
-                if name in header_vals:
-                    idx = header_vals.index(name)
-                    return self._col_letter(idx)
-                return self._col_letter(default_idx)
+        # ヘッダ行から列位置を検出
+        header_row = start_row - 1
+        rng_header = f"'{safe_title}'!A{header_row}:Z{header_row}"
+        res_header = self._execute_with_backoff(
+            self.clients.sheets.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=rng_header,
+                valueRenderOption="FORMATTED_VALUE",
+            ),
+            label="values.get[export-header]",
+        )
+        header_vals = (res_header.get("values") or [[]])[0]
 
-            spec_col = col_letter("規格", 7)
-            seibun_col = col_letter("成分表", 8)
-            mihon_col = col_letter("見本", 9)
-            biko_cols = [idx for idx, val in enumerate(header_vals) if str(val).startswith("備考")]
-            note_col = self._col_letter(biko_cols[0]) if biko_cols else self._col_letter(ord(mihon_col) - 65 + 1)
-            note2_col = self._col_letter(biko_cols[1]) if len(biko_cols) > 1 else self._col_letter(ord(note_col) - 65 + 1)
+        def col_letter(name: str, default_idx: int) -> str:
+            if name in header_vals:
+                idx = header_vals.index(name)
+                return self._col_letter(idx)
+            return self._col_letter(default_idx)
 
-            makers_col = [[row[0] if len(row) > 0 else ""] for row in rows]
-            product_col = [[row[1] if len(row) > 1 else ""] for row in rows]
-            spec_values = [[row[2] if len(row) > 2 else ""] for row in rows]
-            notes = [[row[3] if len(row) > 3 else ""] for row in rows]
-            seibun_values = []
-            mihon_values = []
-            for code in cds:
-                s_flag, m_flag = flags_map.get((maker, code), ("", ""))
-                seibun_values.append([s_flag])
-                mihon_values.append([m_flag])
+        # 列位置の検出
+        spec_col = col_letter("規格", 7)                # 既定: H 列
+        seibun_col_letter = col_letter("成分表", 8)     # 既定: I 列
+        # サンプルは見出し互換（サンプル or 見本）。既定: J 列
+        sample_col_letter: str
+        if "サンプル" in header_vals:
+            sample_col_letter = self._col_letter(header_vals.index("サンプル"))
+        elif "見本" in header_vals:
+            sample_col_letter = self._col_letter(header_vals.index("見本"))
+        else:
+            sample_col_letter = self._col_letter(9)
+        maker_cd_col = col_letter("メーカー商品CD", 5)  # 既定: F 列
+        jan_col = col_letter("JAN", 6)                 # 既定: G 列
+        biko_cols = [idx for idx, val in enumerate(header_vals) if str(val).startswith("備考")]
+        # 備考1列目、無ければ J の次列(K) を使用
+        note_col = self._col_letter(biko_cols[0]) if biko_cols else self._col_letter(ord(sample_col_letter) - 65 + 1)
+        # 備考2列目、無ければ 前項の次列(L) を使用
+        note2_col = self._col_letter(biko_cols[1]) if len(biko_cols) > 1 else self._col_letter(ord(note_col) - 65 + 1)
 
-            data_updates = [
-                {"range": f"'{safe_title}'!A{start_row}", "values": [[code] for code in cds]},
-                {"range": f"'{safe_title}'!C{start_row}", "values": makers_col},
-                {"range": f"'{safe_title}'!D{start_row}", "values": product_col},
-                {"range": f"'{safe_title}'!{spec_col}{start_row}", "values": spec_values},
-                {"range": f"'{safe_title}'!{seibun_col}{start_row}", "values": seibun_values},
-                {"range": f"'{safe_title}'!{mihon_col}{start_row}", "values": mihon_values},
-                {"range": f"'{safe_title}'!{note_col}{start_row}", "values": notes},
-                {"range": f"'{safe_title}'!{note2_col}{start_row}", "values": [[""]] * n},
-            ]
-            self.batch_update_values(spreadsheet_id, data_updates)
+        # 値生成（テンプレ式に頼らず値で書く）
+        makers_col = [[row[0] if len(row) > 0 else ""] for row in all_rows]
+        product_col = [[row[1] if len(row) > 1 else ""] for row in all_rows]
+        spec_values = [[row[2] if len(row) > 2 else ""] for row in all_rows]
+        notes = [[row[3] if len(row) > 3 else ""] for row in all_rows]
+        maker_cd_values = [[row[4] if len(row) > 4 else ""] for row in all_rows]
+        jan_values = [[row[5] if len(row) > 5 else ""] for row in all_rows]
 
-        # Delete the initial default sheet (gid 0) at the end of processing
-        try:
-            self.delete_default_sheet(spreadsheet_id)
-        except Exception:
-            # keep silent for users; internals already logged earlier if needed
-            logger.debug("delete_default_sheet failed at end; ignoring")
+        seibun_values: List[List[str]] = []
+        mihon_values: List[List[str]] = []
+        for maker, code, _, _ in flags_list:
+            s_flag, m_flag = flags_map.get((maker, code), ("", ""))
+            seibun_values.append([s_flag])
+            mihon_values.append([m_flag])
 
-        self._dbg("[STEP2] done")
-        return url, self.debug_events
+        n = min(len(all_cds), len(all_rows))
+        all_cds = all_cds[:n]
+        makers_col = makers_col[:n]
+        product_col = product_col[:n]
+        spec_values = spec_values[:n]
+        notes = notes[:n]
+        maker_cd_values = maker_cd_values[:n]
+        jan_values = jan_values[:n]
+        seibun_values = seibun_values[:n]
+        mihon_values = mihon_values[:n]
 
-    def _sanitize_title(self, title: str, existing: set[str]) -> str:
-        base = "".join(c for c in title.strip()[:80] if c not in ':\\/?*[]') or "無名"
-        candidate = base
-        suffix = 1
-        while candidate in existing:
-            suffix += 1
-            candidate = f"{base}_{suffix}"
-            if len(candidate) > 90:
-                candidate = candidate[:90]
-        existing.add(candidate)
-        return candidate
+        data_updates = [
+            {"range": f"'{safe_title}'!A{start_row}", "values": [[code] for code in all_cds]},
+            {"range": f"'{safe_title}'!C{start_row}", "values": makers_col},              # C: メーカー
+            {"range": f"'{safe_title}'!D{start_row}", "values": product_col},             # D: 商品名
+            {"range": f"'{safe_title}'!{maker_cd_col}{start_row}", "values": maker_cd_values},
+            {"range": f"'{safe_title}'!{jan_col}{start_row}", "values": jan_values},
+            {"range": f"'{safe_title}'!{spec_col}{start_row}", "values": spec_values},
+            {"range": f"'{safe_title}'!{seibun_col_letter}{start_row}", "values": seibun_values},
+            {"range": f"'{safe_title}'!{sample_col_letter}{start_row}", "values": mihon_values},
+            {"range": f"'{safe_title}'!{note_col}{start_row}", "values": notes},
+            {"range": f"'{safe_title}'!{note2_col}{start_row}", "values": [[""]] * n},
+        ]
+        self.batch_update_values(spreadsheet_id, data_updates)
+        self._dbg("[MK-SHEET] template formulas preserved: write A/I/J only")
