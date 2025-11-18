@@ -577,15 +577,16 @@ class SheetGenerator:
     ) -> Tuple[str, List[str]]:
         center_conf = center_conf or {}
         self.debug_events = []
+        verbose_diag = os.environ.get("STEP2_VERBOSE_DIAG", "0") == "1"
+        verbose_cfg = os.environ.get("STEP2_VERBOSE_CFG", "0") == "1"
         # 既存スプレッドシートが指定されている場合はそれを使う（シート追加のみ）
         if existing_spreadsheet_id:
             spreadsheet_id = existing_spreadsheet_id
             url = existing_url or f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
-            self._dbg(f"[STEP2] reuse existing spreadsheet id={spreadsheet_id} center_id={center_id}")
         else:
             title = f"依頼書出力_{int(time.time())}"
             self._dbg(f"[STEP2] create {title} center_id={center_id}")
-        if os.environ.get("DRIVE_DIAG", "1") == "1":
+        if verbose_diag:
             try:
                 sa_email = getattr(self.clients.credentials, "service_account_email", "UNKNOWN")
                 self._dbg(f"[STEP2][DIAG] sa_email={sa_email}")
@@ -627,33 +628,35 @@ class SheetGenerator:
         template_id = center_conf.get("templateSpreadsheetId") if template_id_present else self.settings.template_spreadsheet_id
         template_sheet_id = center_conf.get("templateSheetId") if template_sheet_id_present else self.settings.template_sheet_id
         start_row = center_conf.get("exportStartRow", self.settings.start_row)
-        self._dbg(
-            f"[CFG] templateSpreadsheetId source={'center' if template_id_present else 'default'} value={template_id}"
-        )
-        self._dbg(
-            f"[CFG] templateSheetId source={'center' if template_sheet_id_present else 'default'} value={template_sheet_id}"
-        )
-        self._dbg(
-            f"[CFG] exportStartRow source={'center' if export_start_row_present else 'default'} value={start_row}"
-        )
+        if verbose_cfg:
+            self._dbg(
+                f"[CFG] templateSpreadsheetId source={'center' if template_id_present else 'default'} value={template_id}"
+            )
+            self._dbg(
+                f"[CFG] templateSheetId source={'center' if template_sheet_id_present else 'default'} value={template_sheet_id}"
+            )
+            self._dbg(
+                f"[CFG] exportStartRow source={'center' if export_start_row_present else 'default'} value={start_row}"
+            )
         poll_conf = center_conf.get("poll") if center_conf else None
-        if poll_conf:
-            self._dbg(f"[CFG] poll (center) {poll_conf}")
-        else:
-            self._dbg("[CFG] poll default env values")
+        if verbose_cfg:
+            if poll_conf:
+                self._dbg(f"[CFG] poll (center) {poll_conf}")
+            else:
+                self._dbg("[CFG] poll default env values")
 
         if not template_id or not template_sheet_id:
             raise RuntimeError("テンプレートID/シートIDが未設定です (center 設定または環境変数を確認してください)")
 
         export_ranges = self.settings.export_ranges()
         center_export_ranges = center_conf.get("ranges", {}).get("export", {}) if center_conf else {}
-        maker_header_rng = center_export_ranges.get("makerHeader", export_ranges["makerHeader"])
         center_name_rng = center_export_ranges.get("centerName", export_ranges["centerName"])
         month_rng = center_export_ranges.get("month", export_ranges["month"])
-        if center_export_ranges:
-            self._dbg(f"[CFG] export ranges center(specified)={center_export_ranges}")
-        else:
-            self._dbg(f"[CFG] export ranges default={export_ranges}")
+        if verbose_cfg:
+            if center_export_ranges:
+                self._dbg(f"[CFG] export ranges center(specified)={center_export_ranges}")
+            else:
+                self._dbg(f"[CFG] export ranges default={export_ranges}")
 
         flags_map = {(maker, cd): (s_flag, m_flag) for maker, cd, s_flag, m_flag in flags_list}
 
@@ -684,8 +687,24 @@ class SheetGenerator:
             label="sheets.copyTo",
         )
         new_sheet_id = copied.get("sheetId")
+        existing_titles: set[str] = set()
+        try:
+            meta_titles = self._execute_with_backoff(
+                self.clients.sheets.spreadsheets().get(
+                    spreadsheetId=spreadsheet_id, fields="sheets.properties.title"
+                ),
+                label="spreadsheets.get[titles]",
+            )
+            for sheet in meta_titles.get("sheets", []):
+                title_props = sheet.get("properties", {})
+                title_str = title_props.get("title")
+                if title_str:
+                    existing_titles.add(title_str)
+        except Exception as exc:
+            self._dbg(f"[STEP2][WARN] failed to load existing titles {exc}")
+
         # シート名は依頼書タイトル（依頼先名など）を優先して使う
-        safe_title = self._sanitize_title(doc_title or center_name or "依頼書", set())
+        safe_title = self._sanitize_title(doc_title or center_name or "依頼書", existing_titles)
         self._execute_with_backoff(
             self.clients.sheets.spreadsheets().batchUpdate(
                 spreadsheetId=spreadsheet_id,
@@ -796,4 +815,23 @@ class SheetGenerator:
             {"range": f"'{safe_title}'!{note2_col}{start_row}", "values": [[""]] * n},
         ]
         self.batch_update_values(spreadsheet_id, data_updates)
-        self._dbg("[MK-SHEET] template formulas preserved: write A/I/J only")
+
+        if not existing_spreadsheet_id:
+            try:
+                self.delete_default_sheet(spreadsheet_id)
+            except Exception:
+                logger.debug("delete_default_sheet failed at end; ignoring")
+
+        return url, self.debug_events
+
+    def _sanitize_title(self, title: str, existing: set[str]) -> str:
+        base = "".join(c for c in title.strip()[:80] if c not in ':\\/?*[]') or "依頼書"
+        candidate = base
+        suffix = 1
+        while candidate in existing:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+            if len(candidate) > 90:
+                candidate = candidate[:90]
+        existing.add(candidate)
+        return candidate

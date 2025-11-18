@@ -569,6 +569,15 @@ def export_order_documents(
     center_conf = get_center_config(center_id) or {}
     google_clients = get_google_clients(settings)
     sheet_generator = SheetGenerator(settings, google_clients)
+
+    def _emit(message: str) -> None:
+        if log_fn:
+            try:
+                log_fn(message)
+                return
+            except Exception:
+                logger.exception("failed to emit export log via callback")
+        logger.info(message)
     # If a caller provided a realtime log callback, wire it so
     # generate_documents will call it via sheet_generator._dbg.
     if log_fn:
@@ -585,12 +594,25 @@ def export_order_documents(
     catalog_template_id = center_conf.get("templateSpreadsheetId") or settings.template_spreadsheet_id
     catalog = sheet_generator.load_product_catalog(catalog_template_id, catalog_range)
 
+    def _count_destinations(flag_rows: List[List[str]]) -> int:
+        dest_keys = set()
+        for dest, maker, *_ in flag_rows:
+            dest_keys.add(dest or maker or "メーカー名なし")
+        return len(dest_keys)
+
     # 抽出結果シートが指定されていれば最新の flags を読み込む
     if extraction_sheet_id:
+        _emit(f"[STEP2][EXTRACT] center={center_id} sheet_id={extraction_sheet_id}")
         try:
             flags = sheet_generator.load_extraction_sheet(extraction_sheet_id)
+            _emit(f"[STEP2][EXTRACT] rows={len(flags)}")
         except Exception:
             logger.exception("failed to load extraction sheet; fallback to provided flags")
+            _emit("[STEP2][EXTRACT][WARN] load failed; using request payload")
+            _emit(f"[STEP2][EXTRACT] rows={len(flags)}")
+    else:
+        _emit(f"[STEP2][EXTRACT] center={center_id} sheet_id=None (using request payload)")
+        _emit(f"[STEP2][EXTRACT] rows={len(flags)}")
 
     # flags: [依頼先, メーカー, 商品CD, 成分表, 見本]
     # 依頼先ごとに maker_cds と maker_data を構築
@@ -602,6 +624,8 @@ def export_order_documents(
         dest_maker_cds = dest_to_maker_cds.setdefault(dest_key, {})
         dest_maker_cds.setdefault(maker, []).append(code)
 
+    total_destinations = len(dest_to_maker_cds)
+
     # 1つのスプレッドシートファイルを作成し、その中に依頼先ごとのシートを作る
     target_folder = output_folder_id or settings.drive_folder_id
     sheet_generator.debug_events = []
@@ -612,14 +636,19 @@ def export_order_documents(
     )
 
     debug_logs: List[str] = []
-    for dest, m_cds in dest_to_maker_cds.items():
-        m_data = sheet_generator.build_maker_rows(catalog, m_cds)
+    for idx, (dest, m_cds) in enumerate(dest_to_maker_cds.items(), start=1):
+        dest_rows = sum(len(codes) for codes in m_cds.values())
         dest_flags = dest_to_flags.get(dest, [])
+        _emit(
+            f"[STEP2][DEST][{idx}/{total_destinations}] dest={dest or '未設定'} rows={dest_rows}"
+        )
+        m_data = sheet_generator.build_maker_rows(catalog, m_cds)
         # 既存 generate_documents を流用して、同一ファイルにメーカー別シートを追加していく
         _, logs_tmp = sheet_generator.generate_documents(
             m_data,
             m_cds,
             dest_flags,
+            doc_title=dest,
             center_name=center_name,
             center_month=center_month,
             center_conf=center_conf,
