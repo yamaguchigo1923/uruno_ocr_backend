@@ -15,7 +15,7 @@ logger = get_logger("services.sheet_generator")
 
 MakerData = Dict[str, List[List[str]]]
 MakerCodes = Dict[str, List[str]]
-FlagsList = List[List[str]]  # [依頼先?, メーカー, 商品CD, 成分表フラグ, 見本フラグ] 形式を想定
+FlagsList = List[List[str]]  # [依頼先, 成分表フラグ, 見本フラグ, Excel行...] 形式を想定
 
 
 class SheetGenerator:
@@ -254,29 +254,32 @@ class SheetGenerator:
         *,
         center_id: str,
         flags_list: FlagsList,
+        ref_header: List[str],
         folder_id: Optional[str] = None,
         title_prefix: str = "抽出結果",
     ) -> Tuple[str, str]:
+        """抽出結果シートを作成する。
+
+        行構成は [依頼先, 成分表, 見本, Excel行...] とし、
+        Excel行部分のヘッダには参照表(ref_header)をそのまま用いる。
+        依頼先は flags_list 側ですでにイレギュラー変換済みである前提とする。
+        """
         title = f"{title_prefix}_{int(time.time())}_{center_id}"
         ss_id, url = self.create_basic_spreadsheet(title, folder_id)
-        header = ["依頼先", "メーカー", "商品CD", "成分表", "見本"]
+        header = ["依頼先", "成分表", "見本", *ref_header]
         rows = [header]
-        maker_default, maker_code = self.load_irregular_destinations()
-        for maker, code, s_flag, m_flag in flags_list:
-            maker_key = (maker or "").strip() or "メーカー名なし"
-            code_key = (code or "").strip()
-            code_norm = code_key.lstrip("0") or "0"
-            dest = maker_default.get(maker_key)
-            if dest is None:
-                dest = maker_code.get((maker_key, code_norm)) or maker_code.get((maker_key, code_key))
-            if not dest:
-                dest = maker_key
-            rows.append([dest, maker_key, code_key, s_flag, m_flag])
+        for row in flags_list:
+            # row: [dest, s_flag, m_flag, *excel_row]
+            dest = row[0] if len(row) > 0 else ""
+            s_flag = row[1] if len(row) > 1 else ""
+            m_flag = row[2] if len(row) > 2 else ""
+            excel_part = row[3:] if len(row) > 3 else []
+            rows.append([dest, s_flag, m_flag, *excel_part])
         self.update_values(ss_id, "A1", rows, label="values.update[extraction]")
         self._dbg(f"[EXTRACT] sheet id={ss_id} rows={len(rows)-1}")
         return ss_id, url
 
-    def load_extraction_sheet(self, spreadsheet_id: str, sheet_name: Optional[str] = None) -> FlagsList:
+    def load_extraction_sheet(self, spreadsheet_id: str, sheet_name: Optional[str] = None) -> Tuple[List[str], FlagsList]:
         rng = f"{sheet_name}!A1:Z" if sheet_name else "A1:Z"
         res = self._execute_with_backoff(
             self.clients.sheets.spreadsheets().values().get(
@@ -288,48 +291,34 @@ class SheetGenerator:
         )
         values = res.get("values", [])
         if not values:
-            return []
+            return [], []
         header = values[0]
-        # 依頼先列 (A列) はあってもなくても良い。あれば index を取っておく。
         try:
             dest_idx = header.index("依頼先")
-        except ValueError:
-            dest_idx = -1
-        try:
-            maker_idx = header.index("メーカー")
-            cd_idx = header.index("商品CD")
-        except ValueError:
-            self._dbg("[EXTRACT][WARN] header missing required columns")
-            return []
-        # 成分表/見本 の列名互換 (見本/サンプル)
-        try:
             seibun_idx = header.index("成分表")
         except ValueError:
-            seibun_idx = -1
+            self._dbg("[EXTRACT][WARN] header missing required columns (依頼先/成分表)")
+            return header, []
+        # 見本列名互換 (見本/サンプル)
         sample_candidates = [c for c in ("見本", "サンプル") if c in header]
         sample_idx = header.index(sample_candidates[0]) if sample_candidates else -1
         out: FlagsList = []
         for row in values[1:]:
-            if len(row) <= max(maker_idx, cd_idx):
+            if len(row) <= max(dest_idx, seibun_idx):
                 continue
-            dest = (row[dest_idx] or "").strip() if dest_idx >= 0 and dest_idx < len(row) else ""
-            maker = (row[maker_idx] or "").strip()
-            code = (row[cd_idx] or "").strip()
-            if not maker and not code:
-                continue
-            s_flag = (row[seibun_idx].strip() if seibun_idx >= 0 and seibun_idx < len(row) else "") if seibun_idx >= 0 else ""
+            dest = (row[dest_idx] or "").strip() if dest_idx < len(row) else ""
+            s_flag = (row[seibun_idx].strip() if seibun_idx < len(row) else "")
             m_flag_raw = (row[sample_idx].strip() if sample_idx >= 0 and sample_idx < len(row) else "") if sample_idx >= 0 else ""
-            # 正規化: 成分表は "○" のみ、見本は "3" or "○" をそのまま保持
             if s_flag not in {"", "○", "-"}:
                 s_flag = "○" if s_flag else ""
             if m_flag_raw not in {"", "3", "○", "-"}:
-                # 人が編集した場合の緩和 (例: '◯')
                 m_flag = "3" if m_flag_raw == "3" else ("○" if m_flag_raw else "")
             else:
                 m_flag = m_flag_raw
-            out.append([dest, (maker or "メーカー名なし"), code, s_flag, m_flag])
+            excel_part = row[3:] if len(row) > 3 else []
+            out.append([dest, s_flag, m_flag, *excel_part])
         self._dbg(f"[EXTRACT] loaded rows={len(out)}")
-        return out
+        return header, out
     def load_product_catalog(self, spreadsheet_id: str, a1_range: str) -> Dict[str, List[str]]:
         response = self._execute_with_backoff(
             self.clients.sheets.spreadsheets().values().get(
@@ -341,6 +330,18 @@ class SheetGenerator:
         )
         values = response.get("values", [])
         catalog: Dict[str, List[str]] = {}
+        # Detect and remove header row if present. If the first row's first
+        # cell contains non-numeric text like '商品CD' we treat it as header.
+        header_row: Optional[List[str]] = None
+        if values:
+            first = values[0]
+            if first and isinstance(first[0], str) and any(k in first[0] for k in ("商品", "商品CD", "商品コード")):
+                header_row = values.pop(0)
+        # store last catalog header for downstream column-name-based lookups
+        try:
+            self._last_catalog_header = header_row
+        except Exception:
+            self._last_catalog_header = None
         for row in values:
             if not row:
                 continue
@@ -500,12 +501,44 @@ class SheetGenerator:
             for code in cds:
                 row = catalog.get(code) or catalog.get(code.lstrip("0") or "0")
                 if row:
-                    maker_val = row[1] if len(row) > 1 else maker
+                    # Catalog layout (1-based columns):
+                    # A: 商品CD (index 0)
+                    # B: メーカー (index 1)
+                    # C: 商品名 (index 2)
+                    # D,E: 規格 (index 3,4)
+                    # H: メーカー商品CD (index 7)
+                    # I: JAN (index 8)
+                    maker_val = row[1] if len(row) > 1 and row[1] is not None else maker
                     product_name = row[2] if len(row) > 2 else ""
-                    spec = row[3] if len(row) > 3 else ""
-                    maker_product_cd = row[4] if len(row) > 4 else ""
-                    jan = row[5] if len(row) > 5 else ""
-                    note = row[7] if len(row) > 7 else ""
+                    spec_parts: List[str] = []
+                    if len(row) > 3 and row[3]:
+                        spec_parts.append(str(row[3]).strip())
+                    if len(row) > 4 and row[4]:
+                        spec_parts.append(str(row[4]).strip())
+                    spec = " ".join(spec_parts).strip()
+                    maker_product_cd = row[7] if len(row) > 7 else ""
+                    # Determine JAN index: prefer header-driven lookup if header
+                    # was detected when loading the catalog.
+                    jan = ""
+                    jan_idx = 8
+                    try:
+                        hdr = getattr(self, "_last_catalog_header", None)
+                        if hdr and isinstance(hdr, list):
+                            # support header names like 'JAN' or 'JANコード'
+                            for candidate in ("JAN", "JANコード", "JAN Code", "JANコード "):
+                                if candidate in hdr:
+                                    jan_idx = hdr.index(candidate)
+                                    break
+                    except Exception:
+                        jan_idx = 8
+                    if 0 <= jan_idx < len(row):
+                        jan = row[jan_idx]
+                    # try to pick a sensible 'note' column if present (F/G etc.)
+                    note = ""
+                    if len(row) > 6 and row[6]:
+                        note = row[6]
+                    elif len(row) > 5 and row[5]:
+                        note = row[5]
                     # 行構成: [メーカー, 商品名, 規格, 備考, メーカー商品CD, JAN]
                     rows.append([maker_val, product_name, spec, note, maker_product_cd, jan])
                 else:
@@ -769,7 +802,8 @@ class SheetGenerator:
         else:
             sample_col_letter = self._col_letter(9)
         maker_cd_col = col_letter("メーカー商品CD", 5)  # 既定: F 列
-        jan_col = col_letter("JAN", 6)                 # 既定: G 列
+        # Force JAN to be written to G column in the output sheet
+        jan_col = "G"
         biko_cols = [idx for idx, val in enumerate(header_vals) if str(val).startswith("備考")]
         # 備考1列目、無ければ J の次列(K) を使用
         note_col = self._col_letter(biko_cols[0]) if biko_cols else self._col_letter(ord(sample_col_letter) - 65 + 1)
@@ -780,7 +814,8 @@ class SheetGenerator:
         makers_col = [[row[0] if len(row) > 0 else ""] for row in all_rows]
         product_col = [[row[1] if len(row) > 1 else ""] for row in all_rows]
         spec_values = [[row[2] if len(row) > 2 else ""] for row in all_rows]
-        notes = [[row[3] if len(row) > 3 else ""] for row in all_rows]
+        # Leave 備考 (K/L) columns empty as requested
+        notes = [[""] for _ in all_rows]
         maker_cd_values = [[row[4] if len(row) > 4 else ""] for row in all_rows]
         jan_values = [[row[5] if len(row) > 5 else ""] for row in all_rows]
 

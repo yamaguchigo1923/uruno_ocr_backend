@@ -70,8 +70,48 @@ def read_reference_table(file_bytes: bytes, filename: str) -> ReferenceTable:
     else:
         df = df.reset_index(drop=True)
 
-    table: ReferenceTable = [df.columns.tolist()]
-    table.extend(df.values.tolist())
+    # Build initial table (header + rows)
+    header = df.columns.tolist()
+    rows = df.values.tolist()
+
+    # If there is a 備考-like column, and it contains multiple integers
+    # in a single cell, split that row into multiple rows, one per
+    # integer. Other columns are duplicated.
+    remark_idx = None
+    for i, col in enumerate(header):
+        if isinstance(col, str) and "備考" in col:
+            remark_idx = i
+            break
+
+    processed_rows: list[list[str]] = []
+    if remark_idx is None:
+        processed_rows = rows
+    else:
+        import re
+
+        for r in rows:
+            # ensure r is list and has enough columns
+            row = list(r)
+            remark_val = ""
+            if remark_idx < len(row):
+                remark_val = str(row[remark_idx]).strip()
+            # find all integer tokens in the remark cell
+            nums = re.findall(r"\d+", remark_val)
+            if len(nums) <= 1:
+                # keep original row (convert NaN->"" already handled)
+                processed_rows.append(row)
+            else:
+                # create one row per integer, placing that integer in remark column
+                for n in nums:
+                    new_row = row.copy()
+                    # ensure list is long enough
+                    while len(new_row) <= remark_idx:
+                        new_row.append("")
+                    new_row[remark_idx] = n
+                    processed_rows.append(new_row)
+
+    table: ReferenceTable = [header]
+    table.extend(processed_rows)
     return table
 
 
@@ -114,8 +154,8 @@ def build_selections(
         cd = (ref_row[cd_idx]).lstrip("0") or "0"
         maker = ref_row[maker_idx]
         selections.append((maker, cd, "○" if seibun_flag else "-", "3" if mihon_flag else "-"))
-        maker_cds.setdefault(maker or "メーカー名なし", []).append(cd)
-        flags_list.append([maker or "メーカー名なし", cd, "○" if seibun_flag else "-", "3" if mihon_flag else "-"])
+        maker_cds.setdefault(maker or "", []).append(cd)
+        flags_list.append([maker or "", cd, "○" if seibun_flag else "-", "3" if mihon_flag else "-"])
         hits += 1
     logger.debug("[SEL] hits=%s selections=%s", hits, len(selections))
     return selections, maker_cds, flags_list

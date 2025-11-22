@@ -1,6 +1,7 @@
 {
   "id": "ibaraki",
   "id_num": "013",
+  "excel_col": "7",
   "displayName": "茨城町学校給食共同調理",
   "templateSpreadsheetId": "1tIO4OvE5SC0NN1tDEIAbZV6xQ_4QiA3Jd7Pi2gLfN1o",
   "templateSheetId": 1557733602,
@@ -20,7 +21,7 @@
     "maxWaitSec": 600
   },
   "ranges": {
-    "catalog": "'商品'!A10:H30000",
+    "catalog": "'商品'!A10:I30000",
     "export": {
       "makerHeader": "B4:E4",
       "centerName": "B27:E27",

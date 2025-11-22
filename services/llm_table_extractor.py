@@ -126,14 +126,7 @@ class LLMTableExtractor:
         if not deployment:
             raise LLMExtractionError("Azure OpenAI deployment/model is not specified")
 
-        if log_fn:
-            try:
-                init_deployment = effective_conf.get("deployment") or effective_conf.get("model") or deployment
-                log_fn(
-                    f"[LLM][INIT] deployment={init_deployment} client_ready={self.is_available}"
-                )
-            except Exception:
-                pass
+        # INITログはテスト時にはノイズになるため省略
 
         temperature = float(effective_conf.get("temperature", 0.0) or 0.0)
         max_output_tokens = int(effective_conf.get("max_output_tokens", 2048) or 2048)
@@ -217,20 +210,12 @@ class LLMTableExtractor:
             }
 
         if log_fn:
-            try:
-                meta_keys = list(metadata_payload.keys())
-            except Exception:
-                meta_keys = []
-            format_tag = "json_schema" if extra_body else "none"
+            # 必要なリクエスト情報のみログ出力
             try:
                 log_fn(
                     f"[LLM] request deployment={deployment} tables={len(payload.get('tables', []))} "
                     f"rows={total_rows} cells={total_cells} images={total_images}"
                 )
-            except Exception:
-                pass
-            try:
-                log_fn(f"[LLM][META] metadata_keys={meta_keys} format={format_tag}")
             except Exception:
                 pass
 
@@ -270,6 +255,7 @@ class LLMTableExtractor:
         prompt_tokens = getattr(usage, "input_tokens", None) if usage else None
         completion_tokens = getattr(usage, "output_tokens", None) if usage else None
         if log_fn and usage:
+            # トークン使用量のみログ出力
             try:
                 log_fn(
                     f"[LLM] usage prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}"
@@ -289,12 +275,7 @@ class LLMTableExtractor:
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive
             raise LLMExtractionError(f"LLM output is not valid JSON: {exc}") from exc
 
-        if log_fn:
-            try:
-                preview = text[:200].replace("\n", " ")
-                log_fn(f"[LLM][RESPONSE] preview={preview}")
-            except Exception:
-                pass
+        # 応答プレビューはテスト時には不要なので出力しない
 
         rows = parsed.get("rows") if isinstance(parsed, dict) else None
         if rows is None:

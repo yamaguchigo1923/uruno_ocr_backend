@@ -1,6 +1,7 @@
 {
   "id": "daigo",
   "id_num": "006",
+  "excel_col": "7",
   "displayName": "大子町立学校給食センター",
   "coverPages": 1,
   "crop": {
@@ -25,5 +26,13 @@
     "module": [1],
     "col": ["規 格", "規格", "備考"],
     "matching": ["見本提出", "見本 提出", "◯", "○", "O"]
+  },
+  "ranges": {
+    "catalog": "'商品'!A10:I30000",
+    "export": {
+      "makerHeader": "B4:E4",
+      "centerName": "B27:E27",
+      "month": "F27"
+    }
   }
 }

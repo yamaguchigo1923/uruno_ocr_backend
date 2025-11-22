@@ -45,7 +45,7 @@
 
 # データ出力
   "ranges": {
-    "catalog": "'商品'!A10:H30000",
+    "catalog": "'商品'!A10:I30000",
     "export": {
       "makerHeader": "B4:E4",
       "centerName": "B27:E27",

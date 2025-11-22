@@ -77,7 +77,14 @@ class DocumentAnalyzer:
         tables: List[TableBlock] = []
         for index, page_bytes in enumerate(splitted, start=1):
             logger.debug("[PDF][SPLIT] page=%s", index)
-            tables.extend(self.analyze_content(page_bytes).tables)
+            page_tables = self.analyze_content(page_bytes).tables
+            # When analyzing a single-page PDF chunk, the returned TableBlock
+            # objects may not include a page_number. Ensure they carry the
+            # correct page index so downstream grouping by page works.
+            for tb in page_tables:
+                if tb.page_number is None:
+                    tb.page_number = index
+            tables.extend(page_tables)
         return tables
 
     def analyze_files(self, files: Iterable[tuple[str, bytes]]) -> List[TableBlock]:

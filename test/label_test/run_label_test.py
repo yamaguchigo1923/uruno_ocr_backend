@@ -41,6 +41,11 @@ from azure.core.credentials import AzureKeyCredential  # noqa: E402
 from azure.ai.documentintelligence import DocumentIntelligenceClient  # noqa: E402
 from utils.logger import get_logger  # noqa: E402
 
+try:  # パッケージとして実行される場合
+    from .row_alignment import align_rows_by_number  # type: ignore
+except ImportError:  # スクリプト直接実行 (python run_label_test.py) 用フォールバック
+    from row_alignment import align_rows_by_number  # type: ignore
+
 logger = get_logger("test.label_test")
 
 
@@ -152,15 +157,66 @@ def run_single_case(case: LabelTestCase, settings) -> None:
     gt_rows = load_label_csv(csv_path)
     print(f"[TEST] label_csv={csv_path} rows={len(gt_rows)}")
 
-    pred_map = build_prediction_map(header, data_rows)
-    accuracy = compute_accuracy(gt_rows, pred_map)
+    # 行マッチング開始ログ
+    print("[TEST][ALIGN] start number-based row alignment ...")
+
+    # 行マッチング: 正解番号(1列目)と LLM 番号列でシーケンスアラインメント
+    gt_numbers: List[int] = []
+    import csv
+
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # ヘッダ
+        for row in reader:
+            if not row:
+                continue
+            try:
+                n = int(str(row[0]).strip()) if str(row[0]).strip() else None
+            except ValueError:
+                n = None
+            if n is not None:
+                gt_numbers.append(n)
+            else:
+                # 番号が取れない行は、アラインメント上は欠番として扱う
+                gt_numbers.append(-10**9)
+
+    # LLM 側の番号リストは build_prediction_map のヘッダ・行から取得
+    pred_raw = build_prediction_map(header, data_rows)
+    ocr_numbers: List[int] = []
+    max_idx_pred = max(pred_raw.keys(), default=-1)
+    for i in range(max_idx_pred + 1):
+        num_str = pred_raw.get(i, ("", False, False))[0]
+        try:
+            n = int(num_str) if num_str else None
+        except ValueError:
+            n = None
+        if n is not None:
+            ocr_numbers.append(n)
+        else:
+            ocr_numbers.append(-10**9)
+
+    pairs = align_rows_by_number(gt_numbers, ocr_numbers)
+    print(f"[TEST][ALIGN] pairs={len(pairs)} (gt={len(gt_numbers)}, ocr={len(ocr_numbers)})")
+
+    # アラインメント結果に従って、評価用の pred_map を再構築
+    aligned_pred_map: Dict[int, Tuple[str, bool, bool]] = {}
+    for gi, oj in pairs:
+        if gi < 0 or gi >= len(gt_rows):
+            continue
+        if oj < 0 or oj > max_idx_pred:
+            continue
+        num_str, s_flag, m_flag = pred_raw.get(oj, ("", False, False))
+        aligned_pred_map[gi] = (num_str, s_flag, m_flag)
+
+    # T,F 判定はマッチング後の行について実施
+    accuracy = compute_accuracy(gt_rows, aligned_pred_map)
 
     duration = time.time() - start
     print(f"[TEST][RESULT] accuracy={accuracy * 100:.1f}%")
     print(f"[TEST][RESULT] duration={duration:.2f}s")
     print(f"[TEST][RESULT] tokens={used_tokens}")
 
-    write_result_to_csv(csv_path, gt_rows, pred_map, accuracy, duration, used_tokens)
+    write_result_to_csv(csv_path, gt_rows, aligned_pred_map, accuracy, duration, used_tokens)
     print(f"[TEST] csv write done: {csv_path}")
 
 
@@ -361,6 +417,7 @@ def run_llm_extraction_from_di(
     import json as _json
 
     for page_no in sorted(di_page_tables.keys()):
+        page_start = time.time()
         tables = di_page_tables[page_no]
         chosen = pick_widest_table(tables)
         chosen = clean_table(chosen)
@@ -383,28 +440,74 @@ def run_llm_extraction_from_di(
         llm_conf["prompt_lines"] = lines
         conf_page["llm"] = llm_conf
 
-        try:
-            meta = {"source": "di", "image_count": 0, "pages": [page_no]}
-            result = extractor.extract(
-                tables=[chosen],
-                images=None,
-                center_conf=conf_page,
-                center_id=center_id,
-                log_fn=lambda m: print(f"[LLM][p{page_no}] {m}"),
-                meta=meta,
-            )
-        except LLMExtractionError as exc:
-            print(f"[TEST][LLM][ERROR] page={page_no}: {exc}")
-            continue
-        except Exception as exc:
-            print(f"[TEST][LLM][ERROR] page={page_no}: unexpected {exc}")
+        # LLM 呼び出しにリトライ + バックオフを入れる
+        meta = {"source": "di", "image_count": 0, "pages": [page_no]}
+        max_retries = 3
+        backoff_base = 3.0
+        attempt = 0
+        timeout_count = 0
+        result = None
+        while attempt < max_retries:
+            attempt += 1
+            attempt_start = time.time()
+            try:
+                result = extractor.extract(
+                    tables=[chosen],
+                    images=None,
+                    center_conf=conf_page,
+                    center_id=center_id,
+                    log_fn=lambda m: print(f"[LLM][p{page_no}] {m}"),
+                    meta=meta,
+                )
+                elapsed = time.time() - attempt_start
+                # 30秒を超えて返ってきた場合はタイムアウト扱い
+                if elapsed >= 30.0:
+                    print(
+                        f"[TEST][LLM][TIMEOUT] page={page_no} attempt={attempt} elapsed={elapsed:.2f}s (>30s)"
+                    )
+                    timeout_count += 1
+                    # タイムアウトが発生した場合も、max_retries の範囲でバックオフして再試行する
+                    if attempt >= max_retries:
+                        # 上限回数に到達したら、その時点の結果を採用してブレーク
+                        print(
+                            f"[TEST][LLM][INFO] page={page_no}: reached max_retries after timeout (count={timeout_count}), proceed with this result"
+                        )
+                        break
+                    sleep_sec = backoff_base * attempt
+                    print(
+                        f"[TEST][LLM][INFO] page={page_no}: retry after timeout in {sleep_sec:.1f}s (timeout_count={timeout_count}) ..."
+                    )
+                    result = None
+                    time.sleep(sleep_sec)
+                    continue
+                # 正常終了（30秒未満）
+                break
+            except LLMExtractionError as exc:
+                # 明示的な拒否・設定ミスなどは即座にログして中断
+                print(f"[TEST][LLM][ERROR] page={page_no} attempt={attempt}: {exc}")
+                break
+            except Exception as exc:
+                # 一時的な失敗とみなしてリトライ（最大 max_retries 回）
+                print(
+                    f"[TEST][LLM][WARN] page={page_no} attempt={attempt} failed: {type(exc).__name__}: {exc}"
+                )
+                if attempt >= max_retries:
+                    print(f"[TEST][LLM][ERROR] page={page_no}: giving up after {attempt} attempts")
+                    break
+                sleep_sec = backoff_base * attempt
+                print(f"[TEST][LLM][INFO] page={page_no}: retrying in {sleep_sec:.1f}s ...")
+                time.sleep(sleep_sec)
+
+        if result is None:
             continue
 
         if not header:
             header = list(result.header)
         data_rows.extend(result.data_rows)
+        page_elapsed = time.time() - page_start
         print(
-            f"[TEST][LLM][PAGE] {page_no} rows+={len(result.data_rows)} total={len(data_rows)}"
+            f"[TEST][LLM][PAGE] {page_no} rows+={len(result.data_rows)} total={len(data_rows)} "
+            f"time={page_elapsed:.2f}s"
         )
 
     print(f"[TEST][LLM] total_rows={len(data_rows)} cols={len(header) if header else 0}")
@@ -475,6 +578,95 @@ def build_prediction_map(
         pred[idx] = (num_val, s_flag, m_flag)
 
     return pred
+
+
+def _score_number(gt: int, ocr: int) -> int:
+    """正解番号とOCR番号の近さに基づくスコア。
+
+    |gt-ocr|==0: +5, 1: +2, 2: +1, それ以外: -3
+    """
+
+    d = abs(gt - ocr)
+    if d == 0:
+        return 5
+    if d == 1:
+        return 2
+    if d == 2:
+        return 1
+    return -3
+
+
+def align_rows_by_number(gt_numbers: List[int], ocr_numbers: List[int]) -> List[Tuple[int, int]]:
+    """番号のみを用いたシーケンスアラインメントで行マッチングを行う。
+
+    入力:
+        gt_numbers: 正解側番号配列 (長さ N)
+        ocr_numbers: OCR側番号配列 (長さ M)
+
+    出力:
+        (gi, oj) のペアリスト。gi/oj は 0 始まりインデックス。
+    """
+
+    n = len(gt_numbers)
+    m = len(ocr_numbers)
+    gap_penalty = -2
+
+    # dp と trace を (n+1) x (m+1) で確保
+    dp: List[List[int]] = [[0] * (m + 1) for _ in range(n + 1)]
+    trace: List[List[int]] = [[0] * (m + 1) for _ in range(n + 1)]
+
+    # 初期化
+    for i in range(1, n + 1):
+        dp[i][0] = dp[i - 1][0] + gap_penalty
+        trace[i][0] = 1  # 正解側スキップ
+    for j in range(1, m + 1):
+        dp[0][j] = dp[0][j - 1] + gap_penalty
+        trace[0][j] = 2  # OCR側スキップ
+
+    # 遷移
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            match_score = dp[i - 1][j - 1] + _score_number(gt_numbers[i - 1], ocr_numbers[j - 1])
+            skip_gt = dp[i - 1][j] + gap_penalty
+            skip_ocr = dp[i][j - 1] + gap_penalty
+
+            best = match_score
+            t = 0
+            if skip_gt > best:
+                best = skip_gt
+                t = 1
+            if skip_ocr > best:
+                best = skip_ocr
+                t = 2
+
+            dp[i][j] = best
+            trace[i][j] = t
+
+    # 復元
+    pairs: List[Tuple[int, int]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        t = trace[i][j]
+        if i > 0 and j > 0 and t == 0:
+            # マッチ
+            pairs.append((i - 1, j - 1))
+            i -= 1
+            j -= 1
+        elif i > 0 and (j == 0 or t == 1):
+            # 正解側スキップ (i-1 行目がどの OCR 行にも対応しない)
+            i -= 1
+        elif j > 0 and (i == 0 or t == 2):
+            # OCR側スキップ (j-1 行目がどの 正解 行にも対応しない)
+            j -= 1
+        else:
+            # 保険: どれにも当てはまらない場合は両方デクリメント
+            if i > 0:
+                i -= 1
+            if j > 0:
+                j -= 1
+
+    pairs.reverse()
+    return pairs
 
 
 def compute_accuracy(

@@ -4,6 +4,6 @@
   "deployment": "gpt-4o",
   "model": "gpt-4o",
   "temperature": 0.0,
-  "max_output_tokens": 12000,
+  "max_output_tokens": 8500,
   "schema_name": "normalized_order_table"
 }

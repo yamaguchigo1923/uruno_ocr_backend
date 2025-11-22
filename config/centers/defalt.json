@@ -1,11 +1,12 @@
 {
   "id": "defalt",
   "id_num": "000",
+  "excel_col": "7",
   "displayName": "defalt",
   "templateSpreadsheetId": "1tIO4OvE5SC0NN1tDEIAbZV6xQ_4QiA3Jd7Pi2gLfN1o",
   "templateSheetId": 1557733602,
   "exportStartRow": 32,
-  "coverPages": 0,
+  "coverPages": 1,
   "crop": {
     "top_pct": 0.0,
     "bottom_pct": 0.0,
@@ -30,7 +31,7 @@
     "matching": ["見本提出", "見本 提出", "◯", "○", "O"]
   },
   "ranges": {
-    "catalog": "'商品'!A10:H30000",
+    "catalog": "'商品'!A10:I30000",
     "export": {
       "makerHeader": "B4:E4",
       "centerName": "B27:E27",

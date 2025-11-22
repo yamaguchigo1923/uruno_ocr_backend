@@ -146,6 +146,8 @@ async def order_entry_stream(
                     "[CFG]",
                     "[SEL]",
                     "[OCR]",
+                    "[TEST]",
+                    "[ALIGN]",
                     "[ERROR]",
                     "[RETRY]",
                     "[CENTER]",
@@ -180,7 +182,7 @@ async def order_entry_stream(
                     def _strip_ts(m: str) -> str:
                         return re.sub(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*', '', m)
 
-                    allowed = ["[MK-SHEET]", "[STEP2]", "[STEP1]", "[CFG]", "[SEL]", "[OCR]", "[ERROR]", "[RETRY]", "[CENTER]", "[MATCH]", "[POST]"]
+                    allowed = ["[MK-SHEET]", "[STEP2]", "[STEP1]", "[CFG]", "[SEL]", "[OCR]", "[ERROR]", "[RETRY]", "[CENTER]", "[MATCH]", "[POST]", "[ALIGN]"]
                     filtered = [m for m in result.debug_logs if any(k in _strip_ts(m) for k in allowed)]
                 except Exception:
                     filtered = result.debug_logs
@@ -298,7 +300,8 @@ async def export_documents_stream(payload: ExportRequest):
                     s = re.sub(r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\s*', '', msg)
                 except Exception:
                     s = msg
-                allowed = ["[MK-SHEET]", "[STEP2]", "[STEP1]", "[CFG]", "[SEL]", "[OCR]", "[ERROR]", "[RETRY]", "[CENTER]", "[MATCH]", "[POST]"]
+                allowed = ["[MK-SHEET]", "[STEP2]", "[STEP1]", "[CFG]", "[SEL]", "[OCR]", "[TEST]", "[ERROR]", "[RETRY]", "[CENTER]", "[MATCH]", "[POST]", "[ALIGN]"]
+                allowed = ["[MK-SHEET]", "[STEP2]", "[STEP1]", "[CFG]", "[SEL]", "[OCR]", "[TEST]", "[ERROR]", "[RETRY]", "[CENTER]", "[MATCH]", "[POST]", "[ALIGN]"]
                 if any(k in s for k in allowed):
                     q.put(msg)
                     try:
