@@ -23,8 +23,9 @@ jobs:
 
       - name: Archive backend directory
         run: |
-          echo "Creating backend.zip from backend/"
-          zip -r backend.zip backend
+          echo "Creating backend.zip from repository root (exclude .git and .github)"
+          # Create a zip of the current repo contents. Exclude git metadata and the workflow itself.
+          zip -r backend.zip . -x "./.git/*" "./.github/*" "./backend.zip"
 
       - name: "Deploy to Azure Web App"
         uses: azure/webapps-deploy@v2
